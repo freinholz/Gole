@@ -1,14 +1,16 @@
 {
-    "role": "agent",
+    "role": "client",
     "domain": 1,
     "group": 1,
 
     "relay_eligible": true,
-    "priority": true,
+    "priority": false,
+
+    "registrar_addr": "127.0.0.1:7000",
 
     "transport": {
         "mode": "dynamic",
         "probe_interval": "5m",
-        "threshold": "30ms"
+        "threshold": "50ms"
     }
 }

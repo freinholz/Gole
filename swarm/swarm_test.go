@@ -1319,8 +1319,9 @@ func TestLoadClientConfig(t *testing.T) {
 	if !cfg.RelayEligible {
 		t.Fatal("expected relay_eligible")
 	}
-	if cfg.RegistrarAddr != "10.0.0.1:7000" {
-		t.Fatalf("registrar: %s", cfg.RegistrarAddr)
+	// No registrar_addr in config — resolved via SRV
+	if cfg.RegistrarAddr != "" {
+		t.Fatalf("expected empty registrar_addr, got %s", cfg.RegistrarAddr)
 	}
 
 	rf, err := cfg.RoleFlags()
@@ -1405,6 +1406,37 @@ func TestLoadRelayConfig(t *testing.T) {
 	tc, _ := cfg.TransportConfig()
 	if tc.Mode != ModePeer {
 		t.Fatalf("relay transport mode: %s", tc.Mode)
+	}
+}
+
+func TestResolveRegistrarDirectOverride(t *testing.T) {
+	cfg := &EndpointConfig{RegistrarAddr: "10.0.0.1:7000"}
+	addr, err := cfg.ResolveRegistrar()
+	if err != nil {
+		t.Fatalf("ResolveRegistrar: %v", err)
+	}
+	if addr != "10.0.0.1:7000" {
+		t.Fatalf("expected direct override, got %s", addr)
+	}
+}
+
+func TestResolveRegistrarDevConfig(t *testing.T) {
+	cfg, err := LoadEndpointConfig("examples/client-dev.json")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	addr, err := cfg.ResolveRegistrar()
+	if err != nil {
+		t.Fatalf("ResolveRegistrar: %v", err)
+	}
+	if addr != "127.0.0.1:7000" {
+		t.Fatalf("expected 127.0.0.1:7000, got %s", addr)
+	}
+}
+
+func TestDefaultBrokerSRV(t *testing.T) {
+	if DefaultBrokerSRV != "_swarmbroker._tcp.wixcloud.de" {
+		t.Fatalf("unexpected default SRV: %s", DefaultBrokerSRV)
 	}
 }
 

@@ -6,8 +6,6 @@
     "relay_eligible": false,
     "priority": true,
 
-    "registrar_addr": "10.0.0.1:7000",
-
     "transport": {
         "mode": "peer"
     }

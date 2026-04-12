@@ -1250,3 +1250,123 @@ func TestPAEDistinct(t *testing.T) {
 		t.Fatal("PAE must distinguish different splits")
 	}
 }
+
+// ============================================================
+// Config Loading
+// ============================================================
+
+func TestLoadClientConfig(t *testing.T) {
+	cfg, err := LoadEndpointConfig("examples/client.json")
+	if err != nil {
+		t.Fatalf("LoadEndpointConfig: %v", err)
+	}
+
+	if cfg.Role != "client" {
+		t.Fatalf("role: got %q", cfg.Role)
+	}
+	if cfg.Domain != 1 || cfg.Group != 1 {
+		t.Fatalf("domain/group: %d.%d", cfg.Domain, cfg.Group)
+	}
+	if !cfg.RelayEligible {
+		t.Fatal("expected relay_eligible")
+	}
+	if cfg.RegistrarAddr != "10.0.0.1:7000" {
+		t.Fatalf("registrar: %s", cfg.RegistrarAddr)
+	}
+
+	rf, err := cfg.RoleFlags()
+	if err != nil {
+		t.Fatalf("RoleFlags: %v", err)
+	}
+	if RoleOf(rf) != RoleClient {
+		t.Fatalf("role bits: %d", RoleOf(rf))
+	}
+	if !HasFlag(rf, FlagRelayEligible) {
+		t.Fatal("expected relay eligible flag")
+	}
+
+	tc, err := cfg.TransportConfig()
+	if err != nil {
+		t.Fatalf("TransportConfig: %v", err)
+	}
+	if tc.Mode != ModeDynamic {
+		t.Fatalf("mode: %s", tc.Mode)
+	}
+	if tc.ProbeInterval != 5*time.Minute {
+		t.Fatalf("probe_interval: %v", tc.ProbeInterval)
+	}
+	if tc.Threshold != 50*time.Millisecond {
+		t.Fatalf("threshold: %v", tc.Threshold)
+	}
+
+	dr := cfg.DirectRoute()
+	if dr == nil || dr.IP != "192.168.1.100" || dr.Port != 9000 || dr.Proto != "udp" {
+		t.Fatalf("direct route: %+v", dr)
+	}
+}
+
+func TestLoadAgentConfig(t *testing.T) {
+	cfg, err := LoadEndpointConfig("examples/agent.json")
+	if err != nil {
+		t.Fatalf("LoadEndpointConfig: %v", err)
+	}
+	if cfg.Role != "agent" {
+		t.Fatalf("role: %q", cfg.Role)
+	}
+	if !cfg.Priority {
+		t.Fatal("expected priority flag")
+	}
+
+	rf, _ := cfg.RoleFlags()
+	if RoleOf(rf) != RoleAgent {
+		t.Fatalf("role bits: %d", RoleOf(rf))
+	}
+	if !HasFlag(rf, FlagPriority) {
+		t.Fatal("expected priority flag in roleflags")
+	}
+}
+
+func TestLoadPinnedConfig(t *testing.T) {
+	cfg, err := LoadEndpointConfig("examples/client-pinned.json")
+	if err != nil {
+		t.Fatalf("LoadEndpointConfig: %v", err)
+	}
+
+	tc, err := cfg.TransportConfig()
+	if err != nil {
+		t.Fatalf("TransportConfig: %v", err)
+	}
+	if tc.Mode != ModePinned {
+		t.Fatalf("mode: %s", tc.Mode)
+	}
+	if tc.PinnedRelay == nil {
+		t.Fatal("expected pinned relay")
+	}
+	if tc.PinnedRelay.Domain != 1 || tc.PinnedRelay.Group != 1 || tc.PinnedRelay.Endpoint != 5 {
+		t.Fatalf("pinned relay addr: %s", tc.PinnedRelay)
+	}
+}
+
+func TestLoadRelayConfig(t *testing.T) {
+	cfg, err := LoadEndpointConfig("examples/relay.json")
+	if err != nil {
+		t.Fatalf("LoadEndpointConfig: %v", err)
+	}
+
+	rf, _ := cfg.RoleFlags()
+	if RoleOf(rf) != RoleRelay {
+		t.Fatalf("role bits: %d", RoleOf(rf))
+	}
+
+	tc, _ := cfg.TransportConfig()
+	if tc.Mode != ModePeer {
+		t.Fatalf("relay transport mode: %s", tc.Mode)
+	}
+}
+
+func TestDirectRouteNilWhenEmpty(t *testing.T) {
+	cfg := &EndpointConfig{Role: "client"}
+	if cfg.DirectRoute() != nil {
+		t.Fatal("expected nil DirectRoute when IP empty")
+	}
+}

@@ -1,0 +1,20 @@
+{
+    "role": "client",
+    "domain": 1,
+    "group": 1,
+
+    "relay_eligible": true,
+    "priority": false,
+
+    "registrar_addr": "10.0.0.1:7000",
+
+    "transport": {
+        "mode": "dynamic",
+        "probe_interval": "5m",
+        "threshold": "50ms"
+    },
+
+    "direct_ip": "192.168.1.100",
+    "direct_port": 9000,
+    "direct_proto": "udp"
+}

@@ -1,0 +1,20 @@
+{
+    "role": "agent",
+    "domain": 1,
+    "group": 1,
+
+    "relay_eligible": true,
+    "priority": true,
+
+    "registrar_addr": "10.0.0.1:7000",
+
+    "transport": {
+        "mode": "dynamic",
+        "probe_interval": "5m",
+        "threshold": "30ms"
+    },
+
+    "direct_ip": "10.0.0.50",
+    "direct_port": 9001,
+    "direct_proto": "tcp"
+}

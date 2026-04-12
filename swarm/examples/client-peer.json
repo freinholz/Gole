@@ -1,0 +1,18 @@
+{
+    "role": "client",
+    "domain": 1,
+    "group": 1,
+
+    "relay_eligible": false,
+    "priority": false,
+
+    "registrar_addr": "10.0.0.1:7000",
+
+    "transport": {
+        "mode": "peer"
+    },
+
+    "direct_ip": "203.0.113.45",
+    "direct_port": 9000,
+    "direct_proto": "udp"
+}

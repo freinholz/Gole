@@ -1,53 +1,73 @@
 package swarm
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Registration states (uint8 state machine).
-// Endpoints transition through these states during registration.
 //
 //	Unregistered -> Requesting -> ChallengeIssued -> ChallengeResponse -> Registered -> Active
-//	Any state can transition to Revoked.
+//	Any state -> Revoked.
 const (
-	StateUnregistered     uint8 = 0x00
-	StateRequesting       uint8 = 0x01
-	StateChallengeIssued  uint8 = 0x02
+	StateUnregistered      uint8 = 0x00
+	StateRequesting        uint8 = 0x01
+	StateChallengeIssued   uint8 = 0x02
 	StateChallengeResponse uint8 = 0x03
-	StateRegistered       uint8 = 0x04
-	StateActive           uint8 = 0x05
-	StateRevoked          uint8 = 0xFF
+	StateRegistered        uint8 = 0x04
+	StateActive            uint8 = 0x05
+	StateRevoked           uint8 = 0xFF
 )
 
-// Endpoint roles determine communication direction.
-// Only clients may initiate flows; only agents may receive them.
+// Role values occupy the lower 2 bits of the RoleFlags byte.
 const (
-	RoleClient uint8 = 0x01
-	RoleAgent  uint8 = 0x02
+	RoleClient uint8 = 0x01 // Initiates flows to agents
+	RoleAgent  uint8 = 0x02 // Receives flows from clients
+	RoleRelay  uint8 = 0x03 // Transport relay: verifies PASETO, forwards data
+	RoleMask   uint8 = 0x03 // Lower 2 bits
 )
 
-// EndpointID uniquely identifies an endpoint within a group (1-254, 0 reserved).
-type EndpointID uint8
+// Flag bits occupy the upper 6 bits of the RoleFlags byte.
+const (
+	FlagRelayEligible uint8 = 0x04 // Bit 2: may fall back to relay
+	FlagPriority      uint8 = 0x08 // Bit 3: high-priority endpoint
+	// Bits 4-7 reserved
+)
 
-// DomainID identifies a business domain. Endpoints in different domains cannot communicate.
+// RoleOf extracts the role (lower 2 bits) from a RoleFlags byte.
+func RoleOf(flags uint8) uint8 { return flags & RoleMask }
+
+// HasFlag checks whether a specific flag bit is set.
+func HasFlag(flags, flag uint8) bool { return flags&flag != 0 }
+
+// MakeRoleFlags combines a role with flag bits.
+func MakeRoleFlags(role uint8, flags uint8) uint8 {
+	return (role & RoleMask) | (flags & ^RoleMask)
+}
+
+// EndpointID uniquely identifies an endpoint within a group (uint16, 1-65534).
+type EndpointID uint16
+
+// DomainID identifies a business domain.
 type DomainID uint8
 
 // GroupID identifies an isolation group within a domain.
-// Provides finer-grained isolation than domain alone.
 type GroupID uint8
 
-// EndpointAddr is the full swarm address of an endpoint: domain.group.endpoint + role.
+// EndpointAddr is the full swarm address: domain.group.endpoint + role/flags.
 type EndpointAddr struct {
-	Domain   DomainID
-	Group    GroupID
-	Endpoint EndpointID
-	Role     uint8
+	Domain    DomainID
+	Group     GroupID
+	Endpoint  EndpointID
+	RoleFlags uint8
 }
 
+func (a EndpointAddr) Role() uint8  { return RoleOf(a.RoleFlags) }
 func (a EndpointAddr) String() string {
-	role := "client"
-	if a.Role == RoleAgent {
-		role = "agent"
-	}
-	return fmt.Sprintf("%s@%d.%d.%d", role, a.Domain, a.Group, a.Endpoint)
+	return fmt.Sprintf("%s@%d.%d.%d", RoleName(a.Role()), a.Domain, a.Group, a.Endpoint)
+}
+func (a EndpointAddr) AddrKey() string {
+	return fmt.Sprintf("%d.%d.%d", a.Domain, a.Group, a.Endpoint)
 }
 
 // StateName returns a human-readable name for a registration state.
@@ -79,40 +99,140 @@ func RoleName(r uint8) string {
 		return "client"
 	case RoleAgent:
 		return "agent"
+	case RoleRelay:
+		return "relay"
 	default:
 		return fmt.Sprintf("unknown(%d)", r)
 	}
 }
 
-// RegistrationRequest is sent by an endpoint to begin registration.
+// --- Registration protocol messages ---
+
 type RegistrationRequest struct {
-	PublicKey []byte   // Ed25519 public key (32 bytes)
+	PublicKey []byte // Ed25519 public key (32 bytes)
 	Domain    DomainID
 	Group     GroupID
-	Role      uint8
+	RoleFlags uint8
 }
 
-// Challenge is sent by the controller to verify key ownership.
 type Challenge struct {
 	Nonce [32]byte
 }
 
-// ChallengeResponse proves the endpoint owns the private key.
 type ChallengeResponse struct {
-	Signature []byte // Ed25519 signature over the challenge nonce
+	Signature []byte
 }
 
-// RegistrationResult is returned after successful registration.
 type RegistrationResult struct {
 	ID    EndpointID
-	Token string // PASETO v4.public token binding ID to public key
+	Token string
 }
 
-// SwarmMessage represents an authenticated, addressed message in the swarm.
+// RegistrationInfo is the full response a registrar returns to an endpoint
+// after successful registration and activation. It includes everything the
+// endpoint needs: its identity token, the trust root for verifying peers,
+// and available relays for transport.
+type RegistrationInfo struct {
+	ID           EndpointID
+	Token        string
+	RegistrarKey []byte      // Ed25519 public key of the registrar (trust root)
+	Relays       []RelayInfo // Available relays in the endpoint's domain
+}
+
+// RegisteredEndpoint holds the state of a registered endpoint.
+type RegisteredEndpoint struct {
+	Addr      EndpointAddr
+	PublicKey []byte // Ed25519 public key
+	State     uint8
+	Token     string
+}
+
+// --- Transport modes ---
+
+// TransportMode controls how an endpoint routes traffic.
+type TransportMode uint8
+
+const (
+	ModePinned  TransportMode = 0x01 // Always use relay
+	ModePeer    TransportMode = 0x02 // Always use P2P (hole-punching)
+	ModeDynamic TransportMode = 0x03 // Choose best, re-evaluate continuously
+)
+
+func (m TransportMode) String() string {
+	switch m {
+	case ModePinned:
+		return "pinned"
+	case ModePeer:
+		return "peer"
+	case ModeDynamic:
+		return "dynamic"
+	default:
+		return fmt.Sprintf("unknown(%d)", m)
+	}
+}
+
+// TransportConfig controls transport selection behaviour.
+type TransportConfig struct {
+	Mode          TransportMode
+	ProbeInterval time.Duration // Re-probe interval for dynamic mode (default 5m)
+	Threshold     time.Duration // Latency difference to trigger switch in dynamic mode
+}
+
+// DefaultTransportConfig returns a sensible default transport configuration.
+func DefaultTransportConfig() TransportConfig {
+	return TransportConfig{
+		Mode:          ModeDynamic,
+		ProbeInterval: 5 * time.Minute,
+		Threshold:     50 * time.Millisecond,
+	}
+}
+
+// TransportDecision is the outcome of transport selection.
+type TransportDecision struct {
+	UseRelay     bool
+	RelayAddr    *EndpointAddr // nil if P2P
+	P2PLatency   time.Duration // measured, 0 if unavailable
+	RelayLatency time.Duration // best relay latency, 0 if unavailable
+}
+
+// RelayInfo describes a relay endpoint available for transport.
+type RelayInfo struct {
+	Addr    EndpointAddr
+	Latency time.Duration // last measured latency (0 = not yet probed)
+}
+
+// --- Messages ---
+
 type SwarmMessage struct {
 	From      EndpointAddr
 	To        EndpointAddr
-	Token     string // Sender's PASETO token (signed by controller)
+	Token     string // Sender's PASETO token
 	Payload   []byte
-	Signature []byte // Ed25519 signature over payload (signed by sender)
+	Signature []byte // Ed25519 signature over payload
 }
+
+// --- Relay wire protocol ---
+
+const (
+	FrameAuth     uint8 = 0x01 // Endpoint -> Relay: PASETO token in payload
+	FrameAuthOK   uint8 = 0x02 // Relay -> Endpoint: accepted
+	FrameAuthFail uint8 = 0x03 // Relay -> Endpoint: rejected
+	FrameData     uint8 = 0x10 // Bidirectional: forwarded data
+	FrameNoRoute  uint8 = 0x11 // Relay -> Endpoint: destination not connected
+	FramePing     uint8 = 0x20 // Latency probe request (payload = 8-byte nonce)
+	FramePong     uint8 = 0x21 // Latency probe response (echoes nonce)
+)
+
+// RelayFrameHeader is a compact 9-byte binary header.
+//
+//	[1] Type  [1] DstDomain  [1] DstGroup  [2] DstEndpoint  [4] PayloadLen
+type RelayFrameHeader struct {
+	Type        uint8
+	DstDomain   uint8
+	DstGroup    uint8
+	DstEndpoint uint16
+	PayloadLen  uint32
+}
+
+const RelayFrameHeaderSize = 9
+const MaxRelayPayload = 1 << 20 // 1 MB

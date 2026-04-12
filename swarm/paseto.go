@@ -7,8 +7,7 @@ package swarm
 // Security properties:
 //   - Tokens are signed by the controller's Ed25519 key and cannot be forged.
 //   - Each token binds an EndpointID to a specific Ed25519 public key,
-//     domain, group, and role. An endpoint cannot claim another's ID
-//     without possessing the controller's private key.
+//     domain, group, and role/flags. An endpoint cannot claim another's ID.
 //   - Tokens expire and must be refreshed.
 
 import (
@@ -25,13 +24,11 @@ import (
 const pasetoHeader = "v4.public."
 
 // TokenClaims is the payload embedded in a PASETO v4.public token.
-// The controller signs these claims, binding the endpoint's cryptographic
-// identity (PublicKey) to its swarm address (ID, Domain, Group, Role).
 type TokenClaims struct {
 	EndpointID EndpointID `json:"eid"`
 	Domain     DomainID   `json:"dom"`
 	Group      GroupID    `json:"grp"`
-	Role       uint8      `json:"role"`
+	RoleFlags  uint8      `json:"rf"`
 	PublicKey  []byte     `json:"pk"`  // Ed25519 public key of the endpoint
 	IssuedAt   time.Time  `json:"iat"`
 	ExpiresAt  time.Time  `json:"exp"`
@@ -46,7 +43,6 @@ func le64(n int) []byte {
 }
 
 // pae implements Pre-Authentication Encoding (PAE) per the PASETO specification.
-// PAE prevents ambiguity attacks by length-prefixing each piece.
 func pae(pieces ...[]byte) []byte {
 	output := le64(len(pieces))
 	for _, p := range pieces {
@@ -56,23 +52,16 @@ func pae(pieces ...[]byte) []byte {
 	return output
 }
 
-// SignToken creates a PASETO v4.public token.
-//
-// The token is signed with the controller's Ed25519 private key.
-// Signature covers PAE("v4.public.", message, "", "") to prevent
-// canonicalization attacks.
+// SignToken creates a PASETO v4.public token signed with an Ed25519 private key.
 func SignToken(claims *TokenClaims, secretKey ed25519.PrivateKey) (string, error) {
 	message, err := json.Marshal(claims)
 	if err != nil {
 		return "", fmt.Errorf("marshal claims: %w", err)
 	}
 
-	// m2 = PAE(header, message, footer, implicit_assertion)
-	// footer and implicit_assertion are empty for our use case
 	m2 := pae([]byte(pasetoHeader), message, []byte{}, []byte{})
 	signature := ed25519.Sign(secretKey, m2)
 
-	// token = header + base64url(message || signature)
 	payload := make([]byte, len(message)+ed25519.SignatureSize)
 	copy(payload, message)
 	copy(payload[len(message):], signature)
@@ -81,11 +70,6 @@ func SignToken(claims *TokenClaims, secretKey ed25519.PrivateKey) (string, error
 }
 
 // VerifyToken verifies a PASETO v4.public token and returns the claims.
-//
-// Verification checks:
-//  1. Token has correct "v4.public." header
-//  2. Ed25519 signature is valid against the controller's public key
-//  3. Token has not expired
 func VerifyToken(token string, publicKey ed25519.PublicKey) (*TokenClaims, error) {
 	if !strings.HasPrefix(token, pasetoHeader) {
 		return nil, errors.New("invalid token: wrong header")
@@ -104,7 +88,6 @@ func VerifyToken(token string, publicKey ed25519.PublicKey) (*TokenClaims, error
 	message := payload[:len(payload)-ed25519.SignatureSize]
 	signature := payload[len(payload)-ed25519.SignatureSize:]
 
-	// Reconstruct the signed data and verify
 	m2 := pae([]byte(pasetoHeader), message, []byte{}, []byte{})
 	if !ed25519.Verify(publicKey, m2, signature) {
 		return nil, errors.New("invalid token: signature verification failed")

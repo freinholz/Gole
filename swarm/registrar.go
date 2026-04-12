@@ -221,41 +221,60 @@ func (r *Registrar) RevokeEndpoint(addr EndpointAddr) error {
 
 // --- Reachability ---
 
-// UpdateReachability publishes an endpoint's reachability info.
-// The caller must provide a valid PASETO token proving ownership of the address.
-// An endpoint can only update its own record.
-func (r *Registrar) UpdateReachability(addr EndpointAddr, token string, info ReachabilityInfo) error {
+// ObserveEndpoint records an endpoint's public address as seen by the
+// broker from the endpoint's connection. The endpoint doesn't know its
+// own NAT-mapped address — the broker observes it.
+func (r *Registrar) ObserveEndpoint(addr EndpointAddr, observedAddr, proto string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ep := r.getEndpoint(addr)
+	if ep == nil {
+		return errors.New("observe denied: endpoint not found")
+	}
+	if ep.State != StateActive {
+		return fmt.Errorf("observe denied: state is %s", StateName(ep.State))
+	}
+
+	info := r.getOrCreateReachability(addr)
+	info.Direct = &DirectRoute{ObservedAddr: observedAddr, Proto: proto}
+	info.UpdatedAt = time.Now()
+	return nil
+}
+
+// SetRelayRoute records which relay an endpoint is connected to.
+// Called by the endpoint after connecting to a relay. Token-guarded:
+// an endpoint can only update its own relay route.
+func (r *Registrar) SetRelayRoute(addr EndpointAddr, token string, relayAddr EndpointAddr) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	claims, err := VerifyToken(token, r.publicKey)
 	if err != nil {
-		return fmt.Errorf("reachability update denied: %w", err)
+		return fmt.Errorf("relay route update denied: %w", err)
 	}
 	if claims.EndpointID != addr.Endpoint ||
 		claims.Domain != addr.Domain ||
 		claims.Group != addr.Group {
-		return errors.New("reachability update denied: token does not match address")
+		return errors.New("relay route update denied: token does not match address")
 	}
 
 	ep := r.getEndpoint(addr)
 	if ep == nil {
-		return errors.New("reachability update denied: endpoint not found")
+		return errors.New("relay route update denied: endpoint not found")
 	}
 	if ep.State != StateActive {
-		return fmt.Errorf("reachability update denied: state is %s", StateName(ep.State))
+		return fmt.Errorf("relay route update denied: state is %s", StateName(ep.State))
 	}
 
-	info.Addr = addr
+	info := r.getOrCreateReachability(addr)
+	info.Relay = &RelayRoute{RelayAddr: relayAddr}
 	info.UpdatedAt = time.Now()
-	r.reachability[addr.AddrKey()] = &info
 	return nil
 }
 
 // LookupReachability returns how to reach a target endpoint.
-// Returns (nil, nil) if the target has not published reachability — this is
-// not an error, it means the endpoint hasn't announced yet. The caller
-// should fall back to probing all domain relays.
+// Returns (nil, nil) if no reachability info exists yet.
 func (r *Registrar) LookupReachability(target EndpointAddr) (*ReachabilityInfo, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -265,7 +284,6 @@ func (r *Registrar) LookupReachability(target EndpointAddr) (*ReachabilityInfo, 
 		return nil, nil
 	}
 
-	// Validate the endpoint is still active (prevents stale lookups).
 	ep := r.getEndpoint(info.Addr)
 	if ep == nil || ep.State != StateActive {
 		return nil, nil
@@ -275,11 +293,74 @@ func (r *Registrar) LookupReachability(target EndpointAddr) (*ReachabilityInfo, 
 	return &c, nil
 }
 
+// RequestPunch initiates a P2P rendezvous between two endpoints.
+// Returns PunchRequests for both sides: each gets the other's observed
+// public address so they can hole-punch simultaneously.
+func (r *Registrar) RequestPunch(clientAddr, agentAddr EndpointAddr, clientToken string) (*PunchRequest, *PunchRequest, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Verify client token
+	claims, err := VerifyToken(clientToken, r.publicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("punch denied: %w", err)
+	}
+	if claims.EndpointID != clientAddr.Endpoint ||
+		claims.Domain != clientAddr.Domain ||
+		claims.Group != clientAddr.Group {
+		return nil, nil, errors.New("punch denied: token does not match client address")
+	}
+
+	// Look up both sides' observed addresses
+	clientInfo, ok := r.reachability[clientAddr.AddrKey()]
+	if !ok || clientInfo.Direct == nil {
+		return nil, nil, errors.New("punch denied: client has no observed address")
+	}
+	agentInfo, ok := r.reachability[agentAddr.AddrKey()]
+	if !ok || agentInfo.Direct == nil {
+		return nil, nil, errors.New("punch denied: agent has no observed address")
+	}
+
+	// Check both are active
+	clientEp := r.getEndpoint(clientAddr)
+	agentEp := r.getEndpoint(agentAddr)
+	if clientEp == nil || clientEp.State != StateActive {
+		return nil, nil, errors.New("punch denied: client not active")
+	}
+	if agentEp == nil || agentEp.State != StateActive {
+		return nil, nil, errors.New("punch denied: agent not active")
+	}
+
+	// Each side gets the other's observed address
+	forClient := &PunchRequest{
+		PeerAddr:     agentAddr,
+		ObservedAddr: agentInfo.Direct.ObservedAddr,
+		Proto:        agentInfo.Direct.Proto,
+	}
+	forAgent := &PunchRequest{
+		PeerAddr:     clientAddr,
+		ObservedAddr: clientInfo.Direct.ObservedAddr,
+		Proto:        clientInfo.Direct.Proto,
+	}
+
+	return forClient, forAgent, nil
+}
+
 // ClearReachability removes reachability records for an endpoint.
 func (r *Registrar) ClearReachability(addr EndpointAddr) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.reachability, addr.AddrKey())
+}
+
+func (r *Registrar) getOrCreateReachability(addr EndpointAddr) *ReachabilityInfo {
+	key := addr.AddrKey()
+	info, ok := r.reachability[key]
+	if !ok {
+		info = &ReachabilityInfo{Addr: addr}
+		r.reachability[key] = info
+	}
+	return info
 }
 
 // GetEndpointInfo returns a copy of a registered endpoint's info.

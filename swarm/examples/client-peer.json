@@ -12,7 +12,6 @@
         "mode": "peer"
     },
 
-    "direct_ip": "203.0.113.45",
-    "direct_port": 9000,
-    "direct_proto": "udp"
+    "listen_addr": "0.0.0.0:9000",
+    "listen_proto": "udp"
 }

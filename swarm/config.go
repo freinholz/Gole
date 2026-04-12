@@ -18,22 +18,21 @@ type EndpointConfig struct {
 	RelayEligible bool `json:"relay_eligible"` // may fall back to relay
 	Priority      bool `json:"priority"`       // high-priority endpoint
 
-	// Registrar
-	RegistrarAddr string `json:"registrar_addr"` // how to reach the registrar (ip:port)
+	// Broker/Registrar
+	RegistrarAddr string `json:"registrar_addr"` // how to reach the broker (ip:port)
 
 	// Transport
 	Transport TransportModeConfig `json:"transport"`
 
-	// Direct address for P2P reachability (published to broker)
-	DirectIP    string `json:"direct_ip,omitempty"`
-	DirectPort  uint16 `json:"direct_port,omitempty"`
-	DirectProto string `json:"direct_proto,omitempty"` // "tcp" or "udp"
+	// Listen address for the broker connection (local bind)
+	ListenAddr  string `json:"listen_addr,omitempty"`  // local address to bind (e.g. "0.0.0.0:9000")
+	ListenProto string `json:"listen_proto,omitempty"` // "tcp" or "udp"
 }
 
 // TransportModeConfig is the transport section of an endpoint config.
 type TransportModeConfig struct {
-	Mode          string `json:"mode"`           // "pinned", "relay", "peer", "dynamic"
-	PinnedRelay   string `json:"pinned_relay,omitempty"` // "domain.group.endpoint" for pinned mode
+	Mode          string `json:"mode"`                    // "pinned", "relay", "peer", "dynamic"
+	PinnedRelay   string `json:"pinned_relay,omitempty"`  // "domain.group.endpoint" for pinned mode
 	ProbeInterval string `json:"probe_interval,omitempty"` // duration string, e.g. "5m"
 	Threshold     string `json:"threshold,omitempty"`      // duration string, e.g. "50ms"
 }
@@ -128,20 +127,4 @@ func (c *EndpointConfig) TransportConfig() (TransportConfig, error) {
 	}
 
 	return cfg, nil
-}
-
-// DirectRoute returns the configured direct route, or nil if not set.
-func (c *EndpointConfig) DirectRoute() *DirectRoute {
-	if c.DirectIP == "" {
-		return nil
-	}
-	proto := c.DirectProto
-	if proto == "" {
-		proto = "tcp"
-	}
-	return &DirectRoute{
-		IP:    c.DirectIP,
-		Port:  c.DirectPort,
-		Proto: proto,
-	}
 }

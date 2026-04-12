@@ -245,25 +245,36 @@ const MaxRelayPayload = 1 << 20 // 1 MB
 // --- Reachability ---
 
 // ReachabilityInfo describes how to reach an endpoint.
-// Each endpoint publishes up to 2 records to the broker: a direct (P2P)
-// route and a relay route. Clients look these up to decide transport path.
+// The broker maintains this: the direct route is observed from the
+// endpoint's connection to the broker (NAT-mapped public address),
+// and the relay route is set when the endpoint connects to a relay.
 type ReachabilityInfo struct {
 	Addr      EndpointAddr
-	Direct    *DirectRoute // nil if P2P not available
-	Relay     *RelayRoute  // nil if not connected to a relay
+	Direct    *DirectRoute // broker-observed public address for P2P
+	Relay     *RelayRoute  // which relay the endpoint is connected to
 	UpdatedAt time.Time
 }
 
-// DirectRoute holds structured P2P reachability information.
+// DirectRoute holds the endpoint's observed public address as seen by
+// the broker. The endpoint itself doesn't know this (it's behind NAT).
+// The broker records it from the endpoint's connection.
 type DirectRoute struct {
-	IP    string // e.g. "192.168.1.5"
-	Port  uint16 // e.g. 9000
-	Proto string // "tcp" or "udp"
+	ObservedAddr string // NAT-mapped public address (e.g. "203.0.113.5:48291")
+	Proto        string // "tcp" or "udp"
 }
 
 // RelayRoute records which relay an endpoint is connected to.
 type RelayRoute struct {
 	RelayAddr EndpointAddr
+}
+
+// PunchRequest is returned by the broker when a client requests P2P
+// rendezvous. Both sides get each other's observed address and punch
+// simultaneously.
+type PunchRequest struct {
+	PeerAddr     EndpointAddr // the other side's swarm address
+	ObservedAddr string       // the other side's observed public address
+	Proto        string       // "tcp" or "udp"
 }
 
 // --- Relay routing ---

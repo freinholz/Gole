@@ -14,7 +14,6 @@
         "threshold": "30ms"
     },
 
-    "direct_ip": "10.0.0.50",
-    "direct_port": 9001,
-    "direct_proto": "tcp"
+    "listen_addr": "0.0.0.0:9001",
+    "listen_proto": "tcp"
 }

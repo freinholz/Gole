@@ -162,19 +162,18 @@ func (e *Endpoint) Discover(prober Prober, peer EndpointAddr, reg *Registrar) (*
 	return &decision, nil
 }
 
-// PublishReachability publishes this endpoint's reachability info to the
-// broker. Called after connecting to a relay or establishing P2P.
-func (e *Endpoint) PublishReachability(reg *Registrar, direct *DirectRoute, relay *RelayRoute) error {
+// SetRelayRoute tells the broker which relay this endpoint is connected to.
+// Called after connecting to a relay. The direct route (P2P address) is
+// observed by the broker from the endpoint's connection — the endpoint
+// doesn't know its own NAT-mapped address.
+func (e *Endpoint) SetRelayRoute(reg *Registrar, relayAddr EndpointAddr) error {
 	if e.state != StateActive {
-		return fmt.Errorf("cannot publish reachability: state is %s", StateName(e.state))
+		return fmt.Errorf("cannot set relay route: state is %s", StateName(e.state))
 	}
 	if e.addr == nil {
-		return errors.New("cannot publish reachability: not registered")
+		return errors.New("cannot set relay route: not registered")
 	}
-	return reg.UpdateReachability(*e.addr, e.token, ReachabilityInfo{
-		Direct: direct,
-		Relay:  relay,
-	})
+	return reg.SetRelayRoute(*e.addr, e.token, relayAddr)
 }
 
 // LookupTarget queries the broker for a target endpoint's reachability.

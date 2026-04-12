@@ -999,17 +999,21 @@ func TestRelayNoRoute(t *testing.T) {
 // Reachability
 // ============================================================
 
-func TestReachabilityUpdateAndLookup(t *testing.T) {
+func TestObserveAndLookupReachability(t *testing.T) {
 	reg := setupRegistrar(t)
 	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
 	relayEp := registerAndActivate(t, reg, 1, 1, RoleRelay)
 
-	err := agent.PublishReachability(reg,
-		&DirectRoute{IP: "10.0.0.5", Port: 9000, Proto: "tcp"},
-		&RelayRoute{RelayAddr: *relayEp.Addr()},
-	)
+	// Broker observes agent's public address from connection
+	err := reg.ObserveEndpoint(*agent.Addr(), "203.0.113.5:48291", "udp")
 	if err != nil {
-		t.Fatalf("PublishReachability: %v", err)
+		t.Fatalf("ObserveEndpoint: %v", err)
+	}
+
+	// Agent tells broker which relay it connected to
+	err = agent.SetRelayRoute(reg, *relayEp.Addr())
+	if err != nil {
+		t.Fatalf("SetRelayRoute: %v", err)
 	}
 
 	info, err := reg.LookupReachability(*agent.Addr())
@@ -1019,8 +1023,11 @@ func TestReachabilityUpdateAndLookup(t *testing.T) {
 	if info == nil {
 		t.Fatal("expected reachability info")
 	}
-	if info.Direct == nil || info.Direct.IP != "10.0.0.5" || info.Direct.Port != 9000 {
+	if info.Direct == nil || info.Direct.ObservedAddr != "203.0.113.5:48291" {
 		t.Fatalf("direct route mismatch: %+v", info.Direct)
+	}
+	if info.Direct.Proto != "udp" {
+		t.Fatalf("proto mismatch: %s", info.Direct.Proto)
 	}
 	if info.Relay == nil || info.Relay.RelayAddr.Endpoint != relayEp.Addr().Endpoint {
 		t.Fatal("relay route mismatch")
@@ -1048,9 +1055,7 @@ func TestReachabilityAfterRevoke(t *testing.T) {
 	reg := setupRegistrar(t)
 	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
 
-	agent.PublishReachability(reg,
-		&DirectRoute{IP: "10.0.0.5", Port: 9000, Proto: "tcp"}, nil)
-
+	reg.ObserveEndpoint(*agent.Addr(), "1.2.3.4:5000", "tcp")
 	reg.RevokeEndpoint(*agent.Addr())
 
 	info, _ := reg.LookupReachability(*agent.Addr())
@@ -1059,37 +1064,35 @@ func TestReachabilityAfterRevoke(t *testing.T) {
 	}
 }
 
-func TestReachabilityTokenValidation(t *testing.T) {
+func TestRelayRouteTokenValidation(t *testing.T) {
 	reg := setupRegistrar(t)
 	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
 	other := registerAndActivate(t, reg, 1, 1, RoleClient)
+	relayEp := registerAndActivate(t, reg, 1, 1, RoleRelay)
 
-	// Try to update agent's reachability with other's token
-	err := reg.UpdateReachability(*agent.Addr(), other.Token(), ReachabilityInfo{
-		Direct: &DirectRoute{IP: "evil", Port: 666, Proto: "tcp"},
-	})
+	// Try to update agent's relay route with other's token
+	err := reg.SetRelayRoute(*agent.Addr(), other.Token(), *relayEp.Addr())
 	if err == nil {
 		t.Fatal("expected rejection: wrong token")
 	}
 }
 
-func TestEndpointPublishReachability(t *testing.T) {
+func TestEndpointSetRelayRoute(t *testing.T) {
 	reg := setupRegistrar(t)
 	ep := registerAndActivate(t, reg, 1, 1, RoleClient)
+	relayEp := registerAndActivate(t, reg, 1, 1, RoleRelay)
 
-	err := ep.PublishReachability(reg,
-		&DirectRoute{IP: "192.168.1.10", Port: 8080, Proto: "udp"},
-		nil)
+	err := ep.SetRelayRoute(reg, *relayEp.Addr())
 	if err != nil {
-		t.Fatalf("PublishReachability: %v", err)
+		t.Fatalf("SetRelayRoute: %v", err)
 	}
 
 	info, _ := ep.LookupTarget(reg, *ep.Addr())
-	if info == nil || info.Direct == nil {
-		t.Fatal("expected direct route")
+	if info == nil || info.Relay == nil {
+		t.Fatal("expected relay route")
 	}
-	if info.Direct.Proto != "udp" {
-		t.Fatalf("proto mismatch: %s", info.Direct.Proto)
+	if info.Relay.RelayAddr.Endpoint != relayEp.Addr().Endpoint {
+		t.Fatal("relay endpoint mismatch")
 	}
 }
 
@@ -1097,12 +1100,58 @@ func TestClearReachability(t *testing.T) {
 	reg := setupRegistrar(t)
 	ep := registerAndActivate(t, reg, 1, 1, RoleAgent)
 
-	ep.PublishReachability(reg, &DirectRoute{IP: "1.2.3.4", Port: 1, Proto: "tcp"}, nil)
+	reg.ObserveEndpoint(*ep.Addr(), "1.2.3.4:5000", "tcp")
 	reg.ClearReachability(*ep.Addr())
 
 	info, _ := reg.LookupReachability(*ep.Addr())
 	if info != nil {
 		t.Fatal("expected nil after clear")
+	}
+}
+
+func TestRequestPunch(t *testing.T) {
+	reg := setupRegistrar(t)
+	client := registerAndActivate(t, reg, 1, 1, RoleClient)
+	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
+
+	// Broker observes both endpoints' public addresses
+	reg.ObserveEndpoint(*client.Addr(), "198.51.100.10:40000", "udp")
+	reg.ObserveEndpoint(*agent.Addr(), "203.0.113.20:50000", "udp")
+
+	// Client requests P2P rendezvous
+	forClient, forAgent, err := reg.RequestPunch(*client.Addr(), *agent.Addr(), client.Token())
+	if err != nil {
+		t.Fatalf("RequestPunch: %v", err)
+	}
+
+	// Client gets agent's address
+	if forClient.ObservedAddr != "203.0.113.20:50000" {
+		t.Fatalf("client should get agent's addr, got %s", forClient.ObservedAddr)
+	}
+	if forClient.PeerAddr.Endpoint != agent.Addr().Endpoint {
+		t.Fatal("client peer addr mismatch")
+	}
+
+	// Agent gets client's address
+	if forAgent.ObservedAddr != "198.51.100.10:40000" {
+		t.Fatalf("agent should get client's addr, got %s", forAgent.ObservedAddr)
+	}
+	if forAgent.PeerAddr.Endpoint != client.Addr().Endpoint {
+		t.Fatal("agent peer addr mismatch")
+	}
+}
+
+func TestRequestPunchNoObservedAddr(t *testing.T) {
+	reg := setupRegistrar(t)
+	client := registerAndActivate(t, reg, 1, 1, RoleClient)
+	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
+
+	// Only client has observed address, agent doesn't
+	reg.ObserveEndpoint(*client.Addr(), "1.2.3.4:5000", "tcp")
+
+	_, _, err := reg.RequestPunch(*client.Addr(), *agent.Addr(), client.Token())
+	if err == nil {
+		t.Fatal("expected error: agent has no observed address")
 	}
 }
 
@@ -1117,8 +1166,8 @@ func TestDiscoverWithBrokerLookup(t *testing.T) {
 	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
 	client := registerAndActivate(t, reg, 1, 1, RoleClient)
 
-	// Agent publishes: reachable via relayEp
-	agent.PublishReachability(reg, nil, &RelayRoute{RelayAddr: *relayEp.Addr()})
+	// Agent tells broker it's connected to relayEp
+	agent.SetRelayRoute(reg, *relayEp.Addr())
 
 	client.SetTransportConfig(TransportConfig{Mode: ModeRelay})
 
@@ -1299,9 +1348,11 @@ func TestLoadClientConfig(t *testing.T) {
 		t.Fatalf("threshold: %v", tc.Threshold)
 	}
 
-	dr := cfg.DirectRoute()
-	if dr == nil || dr.IP != "192.168.1.100" || dr.Port != 9000 || dr.Proto != "udp" {
-		t.Fatalf("direct route: %+v", dr)
+	if cfg.ListenAddr != "0.0.0.0:9000" {
+		t.Fatalf("listen_addr: %s", cfg.ListenAddr)
+	}
+	if cfg.ListenProto != "udp" {
+		t.Fatalf("listen_proto: %s", cfg.ListenProto)
 	}
 }
 
@@ -1364,9 +1415,12 @@ func TestLoadRelayConfig(t *testing.T) {
 	}
 }
 
-func TestDirectRouteNilWhenEmpty(t *testing.T) {
-	cfg := &EndpointConfig{Role: "client"}
-	if cfg.DirectRoute() != nil {
-		t.Fatal("expected nil DirectRoute when IP empty")
+func TestConfigListenAddrOptional(t *testing.T) {
+	cfg, err := LoadEndpointConfig("examples/client-relay.json")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.ListenAddr != "" {
+		t.Fatalf("expected empty listen_addr, got %q", cfg.ListenAddr)
 	}
 }

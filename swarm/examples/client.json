@@ -14,7 +14,6 @@
         "threshold": "50ms"
     },
 
-    "direct_ip": "192.168.1.100",
-    "direct_port": 9000,
-    "direct_proto": "udp"
+    "listen_addr": "0.0.0.0:9000",
+    "listen_proto": "udp"
 }

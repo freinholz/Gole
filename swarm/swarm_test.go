@@ -1347,13 +1347,6 @@ func TestLoadClientConfig(t *testing.T) {
 	if tc.Threshold != 50*time.Millisecond {
 		t.Fatalf("threshold: %v", tc.Threshold)
 	}
-
-	if cfg.ListenAddr != "0.0.0.0:9000" {
-		t.Fatalf("listen_addr: %s", cfg.ListenAddr)
-	}
-	if cfg.ListenProto != "udp" {
-		t.Fatalf("listen_proto: %s", cfg.ListenProto)
-	}
 }
 
 func TestLoadAgentConfig(t *testing.T) {
@@ -1415,12 +1408,13 @@ func TestLoadRelayConfig(t *testing.T) {
 	}
 }
 
-func TestConfigListenAddrOptional(t *testing.T) {
+func TestConfigRelayMode(t *testing.T) {
 	cfg, err := LoadEndpointConfig("examples/client-relay.json")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.ListenAddr != "" {
-		t.Fatalf("expected empty listen_addr, got %q", cfg.ListenAddr)
+	tc, _ := cfg.TransportConfig()
+	if tc.Mode != ModeRelay {
+		t.Fatalf("expected relay mode, got %s", tc.Mode)
 	}
 }

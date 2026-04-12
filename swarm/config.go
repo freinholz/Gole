@@ -23,10 +23,6 @@ type EndpointConfig struct {
 
 	// Transport
 	Transport TransportModeConfig `json:"transport"`
-
-	// Listen address for the broker connection (local bind)
-	ListenAddr  string `json:"listen_addr,omitempty"`  // local address to bind (e.g. "0.0.0.0:9000")
-	ListenProto string `json:"listen_proto,omitempty"` // "tcp" or "udp"
 }
 
 // TransportModeConfig is the transport section of an endpoint config.

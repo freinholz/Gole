@@ -12,8 +12,5 @@
         "mode": "dynamic",
         "probe_interval": "5m",
         "threshold": "50ms"
-    },
-
-    "listen_addr": "0.0.0.0:9000",
-    "listen_proto": "udp"
+    }
 }

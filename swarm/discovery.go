@@ -4,13 +4,10 @@ package swarm
 // transport mode selection.
 //
 // Transport modes:
-//   - Pinned:  always relay (e.g. strict corporate policy)
+//   - Pinned:  use a specific relay chosen by the user
+//   - Relay:   use the best available relay
 //   - Peer:    always P2P hole-punching
 //   - Dynamic: choose the best option; re-evaluate every ProbeInterval
-//
-// Dynamic mode compares P2P latency vs best relay latency. If P2P
-// exceeds the relay by more than the configured Threshold, traffic
-// moves to the relay. The TransportMonitor re-probes continuously.
 
 import (
 	"sort"
@@ -32,59 +29,100 @@ type Prober interface {
 func SelectTransport(cfg TransportConfig, p2pLatency time.Duration, relays []RelayInfo) TransportDecision {
 	switch cfg.Mode {
 	case ModePinned:
-		best := bestRelay(relays)
+		return selectPinned(cfg, relays)
+	case ModeRelay:
+		return selectBestRelay(relays)
+	case ModePeer:
+		return TransportDecision{UseRelay: false, P2PLatency: p2pLatency}
+	case ModeDynamic:
+		return selectDynamic(cfg, p2pLatency, relays)
+	}
+	return TransportDecision{UseRelay: false, P2PLatency: p2pLatency}
+}
+
+// selectPinned uses the specific relay from cfg.PinnedRelay.
+func selectPinned(cfg TransportConfig, relays []RelayInfo) TransportDecision {
+	if cfg.PinnedRelay == nil {
+		// Misconfiguration fallback: use best relay.
+		return selectBestRelay(relays)
+	}
+	// Look up the pinned relay in available relays for its latency.
+	for _, r := range relays {
+		if r.Addr.AddrKey() == cfg.PinnedRelay.AddrKey() {
+			a := r.Addr
+			return TransportDecision{
+				UseRelay:     true,
+				RelayAddr:    &a,
+				RelayLatency: r.Latency,
+			}
+		}
+	}
+	// Pinned relay not in list: return it anyway with zero latency.
+	// Caller will attempt connection; it may fail.
+	pinnedCopy := *cfg.PinnedRelay
+	return TransportDecision{UseRelay: true, RelayAddr: &pinnedCopy}
+}
+
+// selectBestRelay always uses the best relay by latency.
+func selectBestRelay(relays []RelayInfo) TransportDecision {
+	best := bestRelay(relays)
+	return TransportDecision{
+		UseRelay:     true,
+		RelayAddr:    relayAddr(best),
+		RelayLatency: relayLat(best),
+	}
+}
+
+// selectDynamic compares P2P vs best relay with hysteresis threshold.
+func selectDynamic(cfg TransportConfig, p2pLatency time.Duration, relays []RelayInfo) TransportDecision {
+	best := bestRelay(relays)
+	bestLat := relayLat(best)
+
+	if p2pLatency == 0 && best != nil {
 		return TransportDecision{
 			UseRelay:     true,
 			RelayAddr:    relayAddr(best),
-			RelayLatency: relayLat(best),
+			RelayLatency: bestLat,
 		}
-
-	case ModePeer:
+	}
+	if best == nil {
+		return TransportDecision{UseRelay: false, P2PLatency: p2pLatency}
+	}
+	if p2pLatency > bestLat+cfg.Threshold {
 		return TransportDecision{
-			UseRelay:   false,
-			P2PLatency: p2pLatency,
-		}
-
-	case ModeDynamic:
-		best := bestRelay(relays)
-		bestLat := relayLat(best)
-
-		// If P2P is unavailable (0 means not measured / failed), use relay.
-		if p2pLatency == 0 && best != nil {
-			return TransportDecision{
-				UseRelay:     true,
-				RelayAddr:    relayAddr(best),
-				RelayLatency: bestLat,
-			}
-		}
-
-		// If no relay available, use P2P.
-		if best == nil {
-			return TransportDecision{
-				UseRelay:   false,
-				P2PLatency: p2pLatency,
-			}
-		}
-
-		// Both available: compare. Switch to relay only if P2P exceeds
-		// the relay + threshold (hysteresis to avoid flapping).
-		if p2pLatency > bestLat+cfg.Threshold {
-			return TransportDecision{
-				UseRelay:     true,
-				RelayAddr:    relayAddr(best),
-				P2PLatency:   p2pLatency,
-				RelayLatency: bestLat,
-			}
-		}
-		return TransportDecision{
-			UseRelay:     false,
+			UseRelay:     true,
+			RelayAddr:    relayAddr(best),
 			P2PLatency:   p2pLatency,
 			RelayLatency: bestLat,
 		}
 	}
+	return TransportDecision{
+		UseRelay:     false,
+		P2PLatency:   p2pLatency,
+		RelayLatency: bestLat,
+	}
+}
 
-	// Fallback: P2P
-	return TransportDecision{UseRelay: false, P2PLatency: p2pLatency}
+// PrioritizeRelay ensures a target relay is at the front of the relay list.
+// Used when broker lookup reveals which relay the agent is on.
+func PrioritizeRelay(relays []RelayInfo, target EndpointAddr) []RelayInfo {
+	key := target.AddrKey()
+	result := make([]RelayInfo, 0, len(relays)+1)
+
+	var targetRelay RelayInfo
+	found := false
+	for _, r := range relays {
+		if r.Addr.AddrKey() == key {
+			found = true
+			targetRelay = r
+		} else {
+			result = append(result, r)
+		}
+	}
+	if !found {
+		targetRelay = RelayInfo{Addr: target, Latency: 0}
+	}
+	return append([]RelayInfo{targetRelay}, result...)
 }
 
 // RankRelays sorts relays by latency (lowest first) and returns the sorted

@@ -9,6 +9,7 @@ package swarm
 // The registrar is the single source of truth for:
 //   - Endpoint identity and state
 //   - Which relays are available per domain
+//   - Endpoint reachability (direct P2P address + relay route)
 //   - The trust root (registrar public key) for token verification
 
 import (
@@ -24,7 +25,7 @@ import (
 
 const maxEndpointsPerGroup = 65534 // uint16 IDs 1..65534, 0 reserved
 
-// Registrar handles endpoint registration and relay discovery.
+// Registrar handles endpoint registration, reachability, and relay discovery.
 type Registrar struct {
 	mu sync.RWMutex
 
@@ -37,6 +38,10 @@ type Registrar struct {
 	pending map[string]*PendingRegistration
 
 	nextID map[DomainID]map[GroupID]uint16
+
+	// Reachability records: AddrKey -> info
+	// Each endpoint publishes how to reach it (direct P2P + relay route).
+	reachability map[string]*ReachabilityInfo
 
 	tokenTTL time.Duration
 }
@@ -56,12 +61,13 @@ func NewRegistrar(tokenTTL time.Duration) (*Registrar, error) {
 	}
 
 	return &Registrar{
-		publicKey:  pub,
-		privateKey: priv,
-		endpoints:  make(map[DomainID]map[GroupID]map[EndpointID]*RegisteredEndpoint),
-		pending:    make(map[string]*PendingRegistration),
-		nextID:     make(map[DomainID]map[GroupID]uint16),
-		tokenTTL:   tokenTTL,
+		publicKey:    pub,
+		privateKey:   priv,
+		endpoints:    make(map[DomainID]map[GroupID]map[EndpointID]*RegisteredEndpoint),
+		pending:      make(map[string]*PendingRegistration),
+		nextID:       make(map[DomainID]map[GroupID]uint16),
+		reachability: make(map[string]*ReachabilityInfo),
+		tokenTTL:     tokenTTL,
 	}, nil
 }
 
@@ -199,7 +205,7 @@ func (r *Registrar) ActivateEndpoint(addr EndpointAddr, token string) error {
 	return nil
 }
 
-// RevokeEndpoint transitions any -> Revoked.
+// RevokeEndpoint transitions any -> Revoked and clears reachability.
 func (r *Registrar) RevokeEndpoint(addr EndpointAddr) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -209,7 +215,71 @@ func (r *Registrar) RevokeEndpoint(addr EndpointAddr) error {
 		return errors.New("endpoint not found")
 	}
 	ep.State = StateRevoked
+	delete(r.reachability, addr.AddrKey())
 	return nil
+}
+
+// --- Reachability ---
+
+// UpdateReachability publishes an endpoint's reachability info.
+// The caller must provide a valid PASETO token proving ownership of the address.
+// An endpoint can only update its own record.
+func (r *Registrar) UpdateReachability(addr EndpointAddr, token string, info ReachabilityInfo) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	claims, err := VerifyToken(token, r.publicKey)
+	if err != nil {
+		return fmt.Errorf("reachability update denied: %w", err)
+	}
+	if claims.EndpointID != addr.Endpoint ||
+		claims.Domain != addr.Domain ||
+		claims.Group != addr.Group {
+		return errors.New("reachability update denied: token does not match address")
+	}
+
+	ep := r.getEndpoint(addr)
+	if ep == nil {
+		return errors.New("reachability update denied: endpoint not found")
+	}
+	if ep.State != StateActive {
+		return fmt.Errorf("reachability update denied: state is %s", StateName(ep.State))
+	}
+
+	info.Addr = addr
+	info.UpdatedAt = time.Now()
+	r.reachability[addr.AddrKey()] = &info
+	return nil
+}
+
+// LookupReachability returns how to reach a target endpoint.
+// Returns (nil, nil) if the target has not published reachability — this is
+// not an error, it means the endpoint hasn't announced yet. The caller
+// should fall back to probing all domain relays.
+func (r *Registrar) LookupReachability(target EndpointAddr) (*ReachabilityInfo, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	info, ok := r.reachability[target.AddrKey()]
+	if !ok {
+		return nil, nil
+	}
+
+	// Validate the endpoint is still active (prevents stale lookups).
+	ep := r.getEndpoint(info.Addr)
+	if ep == nil || ep.State != StateActive {
+		return nil, nil
+	}
+
+	c := *info
+	return &c, nil
+}
+
+// ClearReachability removes reachability records for an endpoint.
+func (r *Registrar) ClearReachability(addr EndpointAddr) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.reachability, addr.AddrKey())
 }
 
 // GetEndpointInfo returns a copy of a registered endpoint's info.

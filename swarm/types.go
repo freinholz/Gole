@@ -153,15 +153,18 @@ type RegisteredEndpoint struct {
 type TransportMode uint8
 
 const (
-	ModePinned  TransportMode = 0x01 // Always use relay
-	ModePeer    TransportMode = 0x02 // Always use P2P (hole-punching)
-	ModeDynamic TransportMode = 0x03 // Choose best, re-evaluate continuously
+	ModePinned  TransportMode = 0x01 // Use a SPECIFIC relay (PinnedRelay in config)
+	ModeRelay   TransportMode = 0x02 // Use the BEST available relay
+	ModePeer    TransportMode = 0x03 // Always P2P hole-punching
+	ModeDynamic TransportMode = 0x04 // Choose best, re-evaluate continuously
 )
 
 func (m TransportMode) String() string {
 	switch m {
 	case ModePinned:
 		return "pinned"
+	case ModeRelay:
+		return "relay"
 	case ModePeer:
 		return "peer"
 	case ModeDynamic:
@@ -174,6 +177,7 @@ func (m TransportMode) String() string {
 // TransportConfig controls transport selection behaviour.
 type TransportConfig struct {
 	Mode          TransportMode
+	PinnedRelay   *EndpointAddr // Required for ModePinned: which specific relay to use
 	ProbeInterval time.Duration // Re-probe interval for dynamic mode (default 5m)
 	Threshold     time.Duration // Latency difference to trigger switch in dynamic mode
 }
@@ -219,8 +223,9 @@ const (
 	FrameAuthFail uint8 = 0x03 // Relay -> Endpoint: rejected
 	FrameData     uint8 = 0x10 // Bidirectional: forwarded data
 	FrameNoRoute  uint8 = 0x11 // Relay -> Endpoint: destination not connected
-	FramePing     uint8 = 0x20 // Latency probe request (payload = 8-byte nonce)
-	FramePong     uint8 = 0x21 // Latency probe response (echoes nonce)
+	FramePing         uint8 = 0x20 // Latency probe request (payload = 8-byte nonce)
+	FramePong         uint8 = 0x21 // Latency probe response (echoes nonce)
+	FrameRelayForward uint8 = 0x30 // Reserved: future relay-to-relay transit
 )
 
 // RelayFrameHeader is a compact 9-byte binary header.
@@ -236,3 +241,38 @@ type RelayFrameHeader struct {
 
 const RelayFrameHeaderSize = 9
 const MaxRelayPayload = 1 << 20 // 1 MB
+
+// --- Reachability ---
+
+// ReachabilityInfo describes how to reach an endpoint.
+// Each endpoint publishes up to 2 records to the broker: a direct (P2P)
+// route and a relay route. Clients look these up to decide transport path.
+type ReachabilityInfo struct {
+	Addr      EndpointAddr
+	Direct    *DirectRoute // nil if P2P not available
+	Relay     *RelayRoute  // nil if not connected to a relay
+	UpdatedAt time.Time
+}
+
+// DirectRoute holds structured P2P reachability information.
+type DirectRoute struct {
+	IP    string // e.g. "192.168.1.5"
+	Port  uint16 // e.g. 9000
+	Proto string // "tcp" or "udp"
+}
+
+// RelayRoute records which relay an endpoint is connected to.
+type RelayRoute struct {
+	RelayAddr EndpointAddr
+}
+
+// --- Relay routing ---
+
+// RelayRouter decides how to deliver a frame to a destination.
+// Default: LocalRouter (local sessions only).
+// Future: MeshRouter (relay-to-relay transit via hyperscaler networks).
+type RelayRouter interface {
+	// Route attempts to deliver a frame. Returns true if handled
+	// (delivered or forwarded), false if no route exists.
+	Route(src *RelaySession, dst EndpointAddr, hdr RelayFrameHeader, payload []byte) (handled bool, err error)
+}

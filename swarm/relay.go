@@ -27,6 +27,8 @@ type RelayServer struct {
 
 	mu       sync.RWMutex
 	sessions map[string]*RelaySession // AddrKey -> session
+
+	router RelayRouter // pluggable routing (default: LocalRouter)
 }
 
 // RelaySession is one authenticated endpoint connection.
@@ -38,12 +40,20 @@ type RelaySession struct {
 }
 
 // NewRelayServer creates a relay that trusts tokens signed by the given
-// registrar public key.
+// registrar public key. Uses LocalRouter by default.
 func NewRelayServer(registrarPubKey ed25519.PublicKey) *RelayServer {
-	return &RelayServer{
+	rs := &RelayServer{
 		controllerPubKey: registrarPubKey,
 		sessions:         make(map[string]*RelaySession),
 	}
+	rs.router = &LocalRouter{relay: rs}
+	return rs
+}
+
+// SetRouter replaces the relay's routing strategy.
+// Must be called before accepting connections.
+func (r *RelayServer) SetRouter(router RelayRouter) {
+	r.router = router
 }
 
 // HandleConn runs the relay protocol on a single connection (TCP or KCP).
@@ -87,25 +97,12 @@ func (r *RelayServer) HandleConn(conn net.Conn) error {
 				Group:    GroupID(hdr.DstGroup),
 				Endpoint: EndpointID(hdr.DstEndpoint),
 			}
-			target := r.getSession(dst.AddrKey())
-			if target == nil {
+			handled, routeErr := r.router.Route(session, dst, hdr, payload)
+			if routeErr != nil {
+				continue // target session cleaned up by router
+			}
+			if !handled {
 				r.writeNoRoute(conn, hdr)
-				continue
-			}
-
-			// Forward, writing the source into header so receiver knows sender.
-			fwdHdr := RelayFrameHeader{
-				Type:        FrameData,
-				DstDomain:   uint8(session.Addr.Domain),
-				DstGroup:    uint8(session.Addr.Group),
-				DstEndpoint: uint16(session.Addr.Endpoint),
-				PayloadLen:  uint32(len(payload)),
-			}
-			target.mu.Lock()
-			wErr := writeFrame(target.conn, fwdHdr, payload)
-			target.mu.Unlock()
-			if wErr != nil {
-				r.removeSession(target)
 			}
 
 		default:
@@ -254,4 +251,63 @@ func WritePingFrame(w io.Writer, nonce []byte) error {
 // ReadRelayFrame reads a single frame from a relay connection.
 func ReadRelayFrame(r io.Reader) (RelayFrameHeader, []byte, error) {
 	return readFrame(r)
+}
+
+// --- Routing implementations ---
+
+// LocalRouter checks only locally connected sessions.
+// This is the default router for RelayServer.
+type LocalRouter struct {
+	relay *RelayServer
+}
+
+func (lr *LocalRouter) Route(src *RelaySession, dst EndpointAddr, hdr RelayFrameHeader, payload []byte) (bool, error) {
+	target := lr.relay.getSession(dst.AddrKey())
+	if target == nil {
+		return false, nil
+	}
+
+	// Forward, writing the source into header so receiver knows sender.
+	fwdHdr := RelayFrameHeader{
+		Type:        FrameData,
+		DstDomain:   uint8(src.Addr.Domain),
+		DstGroup:    uint8(src.Addr.Group),
+		DstEndpoint: uint16(src.Addr.Endpoint),
+		PayloadLen:  uint32(len(payload)),
+	}
+	target.mu.Lock()
+	wErr := writeFrame(target.conn, fwdHdr, payload)
+	target.mu.Unlock()
+	if wErr != nil {
+		lr.relay.removeSession(target)
+		return false, wErr
+	}
+	return true, nil
+}
+
+// MeshRouter is a future-ready stub for relay-to-relay forwarding
+// via hyperscaler networks. It tries local delivery first, then would
+// forward to peer relays. Currently only does local delivery.
+type MeshRouter struct {
+	local *LocalRouter
+	// Future fields:
+	// peers map[string]net.Conn  // connections to other relays
+	// routingTable ...
+}
+
+// NewMeshRouter creates a MeshRouter backed by local delivery.
+func NewMeshRouter(relay *RelayServer) *MeshRouter {
+	return &MeshRouter{
+		local: &LocalRouter{relay: relay},
+	}
+}
+
+func (mr *MeshRouter) Route(src *RelaySession, dst EndpointAddr, hdr RelayFrameHeader, payload []byte) (bool, error) {
+	handled, err := mr.local.Route(src, dst, hdr, payload)
+	if handled || err != nil {
+		return handled, err
+	}
+	// Future: look up dst in routing table, forward to peer relay
+	// via FrameRelayForward (0x30).
+	return false, nil
 }

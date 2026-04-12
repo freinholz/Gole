@@ -120,14 +120,27 @@ func (e *Endpoint) Activate(reg *Registrar) error {
 }
 
 // Discover probes relays and P2P, selects transport mode.
+// If reg is non-nil, looks up the target's reachability from the broker
+// to discover which relay the target is on and prioritize it.
 // For Dynamic mode, this also starts the continuous monitor.
-func (e *Endpoint) Discover(prober Prober, peer EndpointAddr) (*TransportDecision, error) {
+func (e *Endpoint) Discover(prober Prober, peer EndpointAddr, reg *Registrar) (*TransportDecision, error) {
 	if e.state != StateActive {
 		return nil, fmt.Errorf("cannot discover: state is %s", StateName(e.state))
 	}
 
+	relays := e.relays
+
+	// If registrar available, look up target's reachability to find
+	// which relay the target is connected to.
+	if reg != nil {
+		reach, _ := reg.LookupReachability(peer)
+		if reach != nil && reach.Relay != nil {
+			relays = PrioritizeRelay(relays, reach.Relay.RelayAddr)
+		}
+	}
+
 	// Probe relays
-	probed := ProbeRelays(prober, e.relays)
+	probed := ProbeRelays(prober, relays)
 	e.relays = probed
 
 	// Probe P2P
@@ -138,7 +151,7 @@ func (e *Endpoint) Discover(prober Prober, peer EndpointAddr) (*TransportDecisio
 
 	// Start continuous monitoring for Dynamic mode
 	if e.transportCfg.Mode == ModeDynamic {
-		e.StopMonitor() // stop any previous
+		e.StopMonitor()
 		e.monitor = NewTransportMonitor(
 			e.transportCfg, prober, peer, probed,
 			func(d TransportDecision) { e.decision = &d },
@@ -147,6 +160,26 @@ func (e *Endpoint) Discover(prober Prober, peer EndpointAddr) (*TransportDecisio
 	}
 
 	return &decision, nil
+}
+
+// PublishReachability publishes this endpoint's reachability info to the
+// broker. Called after connecting to a relay or establishing P2P.
+func (e *Endpoint) PublishReachability(reg *Registrar, direct *DirectRoute, relay *RelayRoute) error {
+	if e.state != StateActive {
+		return fmt.Errorf("cannot publish reachability: state is %s", StateName(e.state))
+	}
+	if e.addr == nil {
+		return errors.New("cannot publish reachability: not registered")
+	}
+	return reg.UpdateReachability(*e.addr, e.token, ReachabilityInfo{
+		Direct: direct,
+		Relay:  relay,
+	})
+}
+
+// LookupTarget queries the broker for a target endpoint's reachability.
+func (e *Endpoint) LookupTarget(reg *Registrar, target EndpointAddr) (*ReachabilityInfo, error) {
+	return reg.LookupReachability(target)
 }
 
 // StopMonitor stops the continuous transport monitor if running.

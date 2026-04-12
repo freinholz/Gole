@@ -571,14 +571,68 @@ func TestEndpointAddrString(t *testing.T) {
 // Transport Mode Selection (Discovery)
 // ============================================================
 
-func TestSelectTransportPinned(t *testing.T) {
-	cfg := TransportConfig{Mode: ModePinned}
+func TestSelectTransportModeRelay(t *testing.T) {
+	cfg := TransportConfig{Mode: ModeRelay}
 	relays := []RelayInfo{
 		{Addr: EndpointAddr{Endpoint: 10}, Latency: 20 * time.Millisecond},
+		{Addr: EndpointAddr{Endpoint: 11}, Latency: 5 * time.Millisecond},
 	}
-	d := SelectTransport(cfg, 5*time.Millisecond, relays)
+	d := SelectTransport(cfg, 1*time.Millisecond, relays)
+	if !d.UseRelay {
+		t.Fatal("relay mode must use relay")
+	}
+	// Should pick best (lowest latency)
+	if d.RelayAddr.Endpoint != 11 {
+		t.Fatalf("expected best relay 11, got %d", d.RelayAddr.Endpoint)
+	}
+}
+
+func TestSelectTransportPinnedSpecific(t *testing.T) {
+	pinned := EndpointAddr{Endpoint: 10}
+	cfg := TransportConfig{Mode: ModePinned, PinnedRelay: &pinned}
+	relays := []RelayInfo{
+		{Addr: EndpointAddr{Endpoint: 10}, Latency: 50 * time.Millisecond},
+		{Addr: EndpointAddr{Endpoint: 11}, Latency: 5 * time.Millisecond}, // better but not pinned
+	}
+	d := SelectTransport(cfg, 1*time.Millisecond, relays)
 	if !d.UseRelay {
 		t.Fatal("pinned mode must use relay")
+	}
+	if d.RelayAddr.Endpoint != 10 {
+		t.Fatalf("pinned mode must use specific relay 10, got %d", d.RelayAddr.Endpoint)
+	}
+}
+
+func TestSelectTransportPinnedMissing(t *testing.T) {
+	pinned := EndpointAddr{Endpoint: 99}
+	cfg := TransportConfig{Mode: ModePinned, PinnedRelay: &pinned}
+	relays := []RelayInfo{
+		{Addr: EndpointAddr{Endpoint: 10}, Latency: 5 * time.Millisecond},
+	}
+	d := SelectTransport(cfg, 1*time.Millisecond, relays)
+	if !d.UseRelay {
+		t.Fatal("pinned mode must use relay even if not in list")
+	}
+	if d.RelayAddr.Endpoint != 99 {
+		t.Fatalf("should return pinned relay 99, got %d", d.RelayAddr.Endpoint)
+	}
+	if d.RelayLatency != 0 {
+		t.Fatal("missing relay should have 0 latency")
+	}
+}
+
+func TestSelectTransportPinnedNil(t *testing.T) {
+	cfg := TransportConfig{Mode: ModePinned} // PinnedRelay is nil
+	relays := []RelayInfo{
+		{Addr: EndpointAddr{Endpoint: 10}, Latency: 5 * time.Millisecond},
+	}
+	d := SelectTransport(cfg, 1*time.Millisecond, relays)
+	if !d.UseRelay {
+		t.Fatal("pinned nil fallback must use relay")
+	}
+	// Falls back to best relay
+	if d.RelayAddr.Endpoint != 10 {
+		t.Fatalf("expected fallback to best relay 10, got %d", d.RelayAddr.Endpoint)
 	}
 }
 
@@ -748,7 +802,7 @@ func TestEndpointDiscover(t *testing.T) {
 	prober := &mockProber{peerLat: 15 * time.Millisecond, relayLat: 20 * time.Millisecond}
 	peer := EndpointAddr{Domain: 1, Group: 1, Endpoint: 99}
 
-	d, err := client.Discover(prober, peer)
+	d, err := client.Discover(prober, peer, nil) // nil registrar = no broker lookup
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
@@ -825,8 +879,11 @@ func TestRelayAuthAndForward(t *testing.T) {
 		}
 	}
 
-	if relay.SessionCount() != 2 {
-		t.Fatalf("expected 2 sessions, got %d", relay.SessionCount())
+	// Wait briefly for both sessions to register
+	time.Sleep(20 * time.Millisecond)
+
+	if sc := relay.SessionCount(); sc != 2 {
+		t.Fatalf("expected 2 sessions, got %d", sc)
 	}
 
 	// ep1 sends data to ep2 via relay
@@ -936,6 +993,250 @@ func TestRelayNoRoute(t *testing.T) {
 
 	client.Close()
 	wg.Wait()
+}
+
+// ============================================================
+// Reachability
+// ============================================================
+
+func TestReachabilityUpdateAndLookup(t *testing.T) {
+	reg := setupRegistrar(t)
+	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
+	relayEp := registerAndActivate(t, reg, 1, 1, RoleRelay)
+
+	err := agent.PublishReachability(reg,
+		&DirectRoute{IP: "10.0.0.5", Port: 9000, Proto: "tcp"},
+		&RelayRoute{RelayAddr: *relayEp.Addr()},
+	)
+	if err != nil {
+		t.Fatalf("PublishReachability: %v", err)
+	}
+
+	info, err := reg.LookupReachability(*agent.Addr())
+	if err != nil {
+		t.Fatalf("LookupReachability: %v", err)
+	}
+	if info == nil {
+		t.Fatal("expected reachability info")
+	}
+	if info.Direct == nil || info.Direct.IP != "10.0.0.5" || info.Direct.Port != 9000 {
+		t.Fatalf("direct route mismatch: %+v", info.Direct)
+	}
+	if info.Relay == nil || info.Relay.RelayAddr.Endpoint != relayEp.Addr().Endpoint {
+		t.Fatal("relay route mismatch")
+	}
+	if info.UpdatedAt.IsZero() {
+		t.Fatal("UpdatedAt should be set")
+	}
+}
+
+func TestReachabilityNotPublished(t *testing.T) {
+	reg := setupRegistrar(t)
+	registerAndActivate(t, reg, 1, 1, RoleAgent)
+
+	target := EndpointAddr{Domain: 1, Group: 1, Endpoint: 999}
+	info, err := reg.LookupReachability(target)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info != nil {
+		t.Fatal("expected nil for unpublished endpoint")
+	}
+}
+
+func TestReachabilityAfterRevoke(t *testing.T) {
+	reg := setupRegistrar(t)
+	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
+
+	agent.PublishReachability(reg,
+		&DirectRoute{IP: "10.0.0.5", Port: 9000, Proto: "tcp"}, nil)
+
+	reg.RevokeEndpoint(*agent.Addr())
+
+	info, _ := reg.LookupReachability(*agent.Addr())
+	if info != nil {
+		t.Fatal("expected nil after revocation")
+	}
+}
+
+func TestReachabilityTokenValidation(t *testing.T) {
+	reg := setupRegistrar(t)
+	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
+	other := registerAndActivate(t, reg, 1, 1, RoleClient)
+
+	// Try to update agent's reachability with other's token
+	err := reg.UpdateReachability(*agent.Addr(), other.Token(), ReachabilityInfo{
+		Direct: &DirectRoute{IP: "evil", Port: 666, Proto: "tcp"},
+	})
+	if err == nil {
+		t.Fatal("expected rejection: wrong token")
+	}
+}
+
+func TestEndpointPublishReachability(t *testing.T) {
+	reg := setupRegistrar(t)
+	ep := registerAndActivate(t, reg, 1, 1, RoleClient)
+
+	err := ep.PublishReachability(reg,
+		&DirectRoute{IP: "192.168.1.10", Port: 8080, Proto: "udp"},
+		nil)
+	if err != nil {
+		t.Fatalf("PublishReachability: %v", err)
+	}
+
+	info, _ := ep.LookupTarget(reg, *ep.Addr())
+	if info == nil || info.Direct == nil {
+		t.Fatal("expected direct route")
+	}
+	if info.Direct.Proto != "udp" {
+		t.Fatalf("proto mismatch: %s", info.Direct.Proto)
+	}
+}
+
+func TestClearReachability(t *testing.T) {
+	reg := setupRegistrar(t)
+	ep := registerAndActivate(t, reg, 1, 1, RoleAgent)
+
+	ep.PublishReachability(reg, &DirectRoute{IP: "1.2.3.4", Port: 1, Proto: "tcp"}, nil)
+	reg.ClearReachability(*ep.Addr())
+
+	info, _ := reg.LookupReachability(*ep.Addr())
+	if info != nil {
+		t.Fatal("expected nil after clear")
+	}
+}
+
+// ============================================================
+// Discover with Broker Lookup
+// ============================================================
+
+func TestDiscoverWithBrokerLookup(t *testing.T) {
+	reg := setupRegistrar(t)
+
+	relayEp := registerAndActivate(t, reg, 1, 1, RoleRelay)
+	agent := registerAndActivate(t, reg, 1, 1, RoleAgent)
+	client := registerAndActivate(t, reg, 1, 1, RoleClient)
+
+	// Agent publishes: reachable via relayEp
+	agent.PublishReachability(reg, nil, &RelayRoute{RelayAddr: *relayEp.Addr()})
+
+	client.SetTransportConfig(TransportConfig{Mode: ModeRelay})
+
+	prober := &mockProber{peerLat: 10 * time.Millisecond, relayLat: 15 * time.Millisecond}
+
+	d, err := client.Discover(prober, *agent.Addr(), reg)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if !d.UseRelay {
+		t.Fatal("ModeRelay should use relay")
+	}
+	// The agent's relay should have been prioritized
+	if d.RelayAddr == nil {
+		t.Fatal("expected relay addr")
+	}
+}
+
+// ============================================================
+// Relay Router Interface
+// ============================================================
+
+func TestRelayLocalRouter(t *testing.T) {
+	reg := setupRegistrar(t)
+	ep1 := registerAndActivate(t, reg, 1, 1, RoleClient)
+	ep2 := registerAndActivate(t, reg, 1, 1, RoleAgent)
+
+	relay := NewRelayServer(reg.PublicKey())
+
+	c1Client, c1Relay := net.Pipe()
+	c2Client, c2Relay := net.Pipe()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); relay.HandleConn(c1Relay) }()
+	go func() { defer wg.Done(); relay.HandleConn(c2Relay) }()
+
+	// Auth both
+	WriteAuthFrame(c1Client, ep1.Token())
+	WriteAuthFrame(c2Client, ep2.Token())
+	ReadRelayFrame(c1Client)
+	ReadRelayFrame(c2Client)
+
+	// Send through LocalRouter
+	go WriteDataFrame(c1Client, *ep2.Addr(), []byte("routed"))
+	hdr, data, err := ReadRelayFrame(c2Client)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if hdr.Type != FrameData || !bytes.Equal(data, []byte("routed")) {
+		t.Fatal("LocalRouter forwarding failed")
+	}
+
+	c1Client.Close()
+	c2Client.Close()
+	wg.Wait()
+}
+
+func TestRelaySetCustomRouter(t *testing.T) {
+	reg := setupRegistrar(t)
+	relay := NewRelayServer(reg.PublicKey())
+
+	// Set MeshRouter (currently same behavior as LocalRouter)
+	mesh := NewMeshRouter(relay)
+	relay.SetRouter(mesh)
+
+	// Verify it's set by running a basic test
+	ep := registerAndActivate(t, reg, 1, 1, RoleClient)
+	client, server := net.Pipe()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); relay.HandleConn(server) }()
+
+	WriteAuthFrame(client, ep.Token())
+	hdr, _, _ := ReadRelayFrame(client)
+	if hdr.Type != FrameAuthOK {
+		t.Fatalf("expected AuthOK, got 0x%02x", hdr.Type)
+	}
+
+	// Send to non-existent → MeshRouter falls through to NoRoute
+	WriteDataFrame(client, EndpointAddr{Endpoint: 9999}, []byte("test"))
+	hdr, _, _ = ReadRelayFrame(client)
+	if hdr.Type != FrameNoRoute {
+		t.Fatalf("expected NoRoute from MeshRouter, got 0x%02x", hdr.Type)
+	}
+
+	client.Close()
+	wg.Wait()
+}
+
+// ============================================================
+// PrioritizeRelay
+// ============================================================
+
+func TestPrioritizeRelay(t *testing.T) {
+	relays := []RelayInfo{
+		{Addr: EndpointAddr{Endpoint: 1}, Latency: 10 * time.Millisecond},
+		{Addr: EndpointAddr{Endpoint: 2}, Latency: 20 * time.Millisecond},
+	}
+
+	// Prioritize existing relay
+	result := PrioritizeRelay(relays, EndpointAddr{Endpoint: 2})
+	if result[0].Addr.Endpoint != 2 {
+		t.Fatalf("expected endpoint 2 first, got %d", result[0].Addr.Endpoint)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 relays, got %d", len(result))
+	}
+
+	// Prioritize new relay not in list
+	result = PrioritizeRelay(relays, EndpointAddr{Endpoint: 99})
+	if result[0].Addr.Endpoint != 99 {
+		t.Fatalf("expected endpoint 99 first, got %d", result[0].Addr.Endpoint)
+	}
+	if len(result) != 3 {
+		t.Fatalf("expected 3 relays, got %d", len(result))
+	}
 }
 
 // ============================================================

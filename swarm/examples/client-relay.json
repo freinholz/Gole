@@ -1,0 +1,9 @@
+{
+    "local_id": "svc-a",
+    "relay_eligible": true,
+    "priority": false,
+
+    "transport": {
+        "mode": "relay"
+    }
+}

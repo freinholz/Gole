@@ -1,0 +1,8 @@
+{
+    "relay_eligible": false,
+    "priority": true,
+
+    "transport": {
+        "mode": "peer"
+    }
+}

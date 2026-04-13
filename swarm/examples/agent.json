@@ -1,0 +1,11 @@
+{
+    "local_id": "svc-a",
+    "relay_eligible": true,
+    "priority": true,
+
+    "transport": {
+        "mode": "dynamic",
+        "probe_interval": "5m",
+        "threshold": "30ms"
+    }
+}

@@ -1,18 +1,31 @@
 LDFLAGS := -ldflags="-s -w"
 SOURCES := main.go common.go cli.go crypt.go kconfig.go holepunch.go server.go client.go
 OUT := gole
+SWARM_OUT := gole-swarm
 ifneq (,$(findstring NT,$(shell uname)))
 	OUT := $(OUT).exe
+	SWARM_OUT := $(SWARM_OUT).exe
 endif
 DATE := $(shell date -u +%Y%m%d)
 
-default: $(OUT)
+default: $(OUT) $(SWARM_OUT)
+
 $(OUT): $(SOURCES)
 	go build $(LDFLAGS) -o $(OUT) $(SOURCES)
 
+# Dedicated swarm binary — built from cmd/swarm, depends on the swarm package.
+.PHONY: swarm
+swarm: $(SWARM_OUT)
+$(SWARM_OUT):
+	go build $(LDFLAGS) -o $(SWARM_OUT) ./cmd/swarm
+
+.PHONY: swarm-test
+swarm-test:
+	go test ./swarm/...
+
 .PHONY: clean
 clean:
-	@-rm -f $(OUT)
+	@-rm -f $(OUT) $(SWARM_OUT)
 	@-rm -f ./client ./server
 	@-rm -f ./gtun
 	@-rm -f *.exe

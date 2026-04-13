@@ -1,0 +1,13 @@
+{
+    "local_id": "dev",
+    "relay_eligible": true,
+    "priority": false,
+
+    "registrar_addr": "127.0.0.1:7000",
+
+    "transport": {
+        "mode": "dynamic",
+        "probe_interval": "5m",
+        "threshold": "50ms"
+    }
+}

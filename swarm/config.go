@@ -12,22 +12,25 @@ import (
 const DefaultBrokerSRV = "_swarmbroker._tcp.wixcloud.de"
 
 // EndpointConfig is the JSON-loadable configuration for a swarm endpoint.
+//
+// Zero-touch design: the config carries only environment-specific
+// preferences. Role comes from the CLI. Domain, group, endpoint ID are
+// all broker-assigned. LocalID distinguishes multiple instances on the
+// same machine (optional for single-instance case).
 type EndpointConfig struct {
 	// Identity
-	Role   string `json:"role"`   // "client", "agent", or "relay"
-	Domain uint8  `json:"domain"` // business domain (1-255)
-	Group  uint8  `json:"group"`  // isolation group within domain (1-255)
+	LocalID string `json:"local_id,omitempty"` // distinguishes instances on same machine
 
 	// Flags
 	RelayEligible bool `json:"relay_eligible"` // may fall back to relay
 	Priority      bool `json:"priority"`       // high-priority endpoint
 
 	// Broker discovery — resolved in order:
-	// 1. registrar_addr if set (direct override)
-	// 2. registrar_srv if set (custom SRV record)
-	// 3. default: _swarmbroker._tcp.wixcloud.de
-	RegistrarAddr string `json:"registrar_addr,omitempty"` // direct override (ip:port)
-	RegistrarSRV  string `json:"registrar_srv,omitempty"`  // custom SRV record
+	//   1. registrar_addr if set (direct override)
+	//   2. registrar_srv if set (custom SRV record)
+	//   3. default: _swarmbroker._tcp.wixcloud.de
+	RegistrarAddr string `json:"registrar_addr,omitempty"`
+	RegistrarSRV  string `json:"registrar_srv,omitempty"`
 
 	// Transport
 	Transport TransportModeConfig `json:"transport"`
@@ -35,8 +38,8 @@ type EndpointConfig struct {
 
 // TransportModeConfig is the transport section of an endpoint config.
 type TransportModeConfig struct {
-	Mode          string `json:"mode"`                    // "pinned", "relay", "peer", "dynamic"
-	PinnedRelay   string `json:"pinned_relay,omitempty"`  // "domain.group.endpoint" for pinned mode
+	Mode          string `json:"mode"`                     // "pinned", "relay", "peer", "dynamic"
+	PinnedRelay   string `json:"pinned_relay,omitempty"`   // "domain.group.endpoint" for pinned mode
 	ProbeInterval string `json:"probe_interval,omitempty"` // duration string, e.g. "5m"
 	Threshold     string `json:"threshold,omitempty"`      // duration string, e.g. "50ms"
 }
@@ -57,27 +60,19 @@ func LoadEndpointConfig(path string) (*EndpointConfig, error) {
 }
 
 // ResolveRegistrar resolves the broker address.
-// Priority: registrar_addr (direct) > registrar_srv (custom SRV) > default SRV.
 func (c *EndpointConfig) ResolveRegistrar() (string, error) {
-	// 1. Direct override
 	if c.RegistrarAddr != "" {
 		return c.RegistrarAddr, nil
 	}
-
-	// 2. SRV lookup
 	srv := c.RegistrarSRV
 	if srv == "" {
 		srv = DefaultBrokerSRV
 	}
-
 	return ResolveSRV(srv)
 }
 
-// ResolveSRV performs a DNS SRV lookup and returns "host:port" of the
-// highest-priority (lowest Priority value), heaviest-weight target.
+// ResolveSRV performs a DNS SRV lookup.
 func ResolveSRV(name string) (string, error) {
-	// net.LookupSRV wants service, proto, name split from _service._proto.name
-	// but also accepts ("", "", fullname) for raw lookup.
 	_, addrs, err := net.LookupSRV("", "", name)
 	if err != nil {
 		return "", fmt.Errorf("SRV lookup %q: %w", name, err)
@@ -85,40 +80,44 @@ func ResolveSRV(name string) (string, error) {
 	if len(addrs) == 0 {
 		return "", fmt.Errorf("SRV lookup %q: no records", name)
 	}
-
-	// SRV records come sorted by priority then weight from net.LookupSRV.
 	best := addrs[0]
 	host := best.Target
-	// Remove trailing dot from DNS name
 	if len(host) > 0 && host[len(host)-1] == '.' {
 		host = host[:len(host)-1]
 	}
 	return fmt.Sprintf("%s:%d", host, best.Port), nil
 }
 
-// RoleFlags returns the packed role+flags byte from the config.
-func (c *EndpointConfig) RoleFlags() (uint8, error) {
-	var role uint8
-	switch c.Role {
+// ParseRole converts a role string ("client", "agent", "relay") to a role byte.
+func ParseRole(role string) (uint8, error) {
+	switch role {
 	case "client":
-		role = RoleClient
+		return RoleClient, nil
 	case "agent":
-		role = RoleAgent
+		return RoleAgent, nil
 	case "relay":
-		role = RoleRelay
+		return RoleRelay, nil
 	default:
-		return 0, fmt.Errorf("unknown role: %q", c.Role)
+		return 0, fmt.Errorf("unknown role: %q", role)
 	}
+}
 
+// BuildRoleFlags combines a role string with config flags into a RoleFlags byte.
+func BuildRoleFlags(role string, cfg *EndpointConfig) (uint8, error) {
+	r, err := ParseRole(role)
+	if err != nil {
+		return 0, err
+	}
 	var flags uint8
-	if c.RelayEligible {
-		flags |= FlagRelayEligible
+	if cfg != nil {
+		if cfg.RelayEligible {
+			flags |= FlagRelayEligible
+		}
+		if cfg.Priority {
+			flags |= FlagPriority
+		}
 	}
-	if c.Priority {
-		flags |= FlagPriority
-	}
-
-	return MakeRoleFlags(role, flags), nil
+	return MakeRoleFlags(r, flags), nil
 }
 
 // TransportConfig converts the JSON transport section to a TransportConfig.
@@ -161,7 +160,6 @@ func (c *EndpointConfig) TransportConfig() (TransportConfig, error) {
 		}
 		cfg.ProbeInterval = d
 	}
-
 	if c.Transport.Threshold != "" {
 		d, err := time.ParseDuration(c.Transport.Threshold)
 		if err != nil {
@@ -169,6 +167,5 @@ func (c *EndpointConfig) TransportConfig() (TransportConfig, error) {
 		}
 		cfg.Threshold = d
 	}
-
 	return cfg, nil
 }

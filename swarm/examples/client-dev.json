@@ -1,8 +1,5 @@
 {
-    "role": "client",
-    "domain": 1,
-    "group": 1,
-
+    "local_id": "dev",
     "relay_eligible": true,
     "priority": false,
 

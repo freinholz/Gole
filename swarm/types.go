@@ -7,8 +7,9 @@ import (
 
 // Registration states (uint8 state machine).
 //
-//	Unregistered -> Requesting -> ChallengeIssued -> ChallengeResponse -> Registered -> Active
+//	Unregistered -> Requesting -> ChallengeIssued -> ChallengeResponse -> Pending -> Registered -> Active
 //	Any state -> Revoked.
+//	Pending -> Denied if admin rejects.
 const (
 	StateUnregistered      uint8 = 0x00
 	StateRequesting        uint8 = 0x01
@@ -16,6 +17,8 @@ const (
 	StateChallengeResponse uint8 = 0x03
 	StateRegistered        uint8 = 0x04
 	StateActive            uint8 = 0x05
+	StatePending           uint8 = 0x06 // key proven, awaiting admin approval
+	StateDenied            uint8 = 0x07 // admin rejected enrollment
 	StateRevoked           uint8 = 0xFF
 )
 
@@ -85,6 +88,10 @@ func StateName(s uint8) string {
 		return "registered"
 	case StateActive:
 		return "active"
+	case StatePending:
+		return "pending"
+	case StateDenied:
+		return "denied"
 	case StateRevoked:
 		return "revoked"
 	default:
@@ -106,45 +113,84 @@ func RoleName(r uint8) string {
 	}
 }
 
-// --- Registration protocol messages ---
+// --- Enrollment protocol messages ---
+//
+// Three-phase enrollment:
+//   1. Enroll:    endpoint -> broker (PublicKey, Fingerprint, RoleFlags)
+//                 broker  -> endpoint (RequestID, Challenge)
+//   2. Confirm:   endpoint -> broker (RequestID, Signature over challenge)
+//                 broker  -> endpoint (EnrollStatus: pending|registered|denied)
+//   3. Poll:      endpoint -> broker (RequestID, Signature over poll nonce)
+//                 broker  -> endpoint (EnrollStatus)
 
-type RegistrationRequest struct {
-	PublicKey []byte // Ed25519 public key (32 bytes)
-	Domain    DomainID
-	Group     GroupID
-	RoleFlags uint8
+// EnrollRequest is phase 1: endpoint announces itself to the broker.
+type EnrollRequest struct {
+	PublicKey   []byte // Ed25519 public key (32 bytes)
+	Fingerprint string // identity fingerprint; empty for relays
+	RoleFlags   uint8
 }
 
+// EnrollResponse is the broker's phase 1 reply.
+type EnrollResponse struct {
+	RequestID string   // opaque handle for confirm + poll
+	Challenge [32]byte // sign with private key to prove ownership
+}
+
+// EnrollConfirm is phase 2: endpoint proves it holds the private key.
+type EnrollConfirm struct {
+	RequestID string
+	Signature []byte // Ed25519 over Challenge
+}
+
+// EnrollStatus is returned by Confirm and Poll.
+// When State == StateRegistered, Result is populated.
+type EnrollStatus struct {
+	State  uint8         // StatePending / StateRegistered / StateDenied
+	Result *EnrollResult // non-nil only when State == StateRegistered
+}
+
+// EnrollResult contains the broker-assigned address and token.
+type EnrollResult struct {
+	Address EndpointAddr // broker-assigned (domain, group, endpoint, roleflags)
+	Token   string       // PASETO v4.public token
+}
+
+// Challenge is kept for compatibility with internal code paths.
 type Challenge struct {
 	Nonce [32]byte
 }
 
+// ChallengeResponse is kept for compatibility; same as EnrollConfirm.Signature.
 type ChallengeResponse struct {
 	Signature []byte
 }
 
-type RegistrationResult struct {
-	ID    EndpointID
-	Token string
-}
-
-// RegistrationInfo is the full response a registrar returns to an endpoint
-// after successful registration and activation. It includes everything the
-// endpoint needs: its identity token, the trust root for verifying peers,
-// and available relays for transport.
+// RegistrationInfo is returned to an endpoint after successful activation.
 type RegistrationInfo struct {
 	ID           EndpointID
 	Token        string
-	RegistrarKey []byte      // Ed25519 public key of the registrar (trust root)
-	Relays       []RelayInfo // Available relays in the endpoint's domain
+	RegistrarKey []byte      // Ed25519 public key of the broker (trust root)
+	Relays       []RelayInfo // available relays in the endpoint's domain
+}
+
+// PendingEnrollment describes an enrollment awaiting admin approval.
+// Returned by Registrar.ListPending() for admin UIs.
+type PendingEnrollment struct {
+	RequestID   string
+	Fingerprint string
+	RoleFlags   uint8
+	PublicKey   []byte
+	CreatedAt   time.Time
+	State       uint8 // StateChallengeIssued / StatePending / StateRegistered / StateDenied
 }
 
 // RegisteredEndpoint holds the state of a registered endpoint.
 type RegisteredEndpoint struct {
-	Addr      EndpointAddr
-	PublicKey []byte // Ed25519 public key
-	State     uint8
-	Token     string
+	Addr        EndpointAddr
+	PublicKey   []byte // Ed25519 public key
+	State       uint8
+	Token       string
+	Fingerprint string // machine+local_id fingerprint (empty for relays)
 }
 
 // --- Transport modes ---

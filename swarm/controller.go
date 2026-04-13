@@ -90,11 +90,12 @@ func (c *Controller) checkFlowRules(from, to EndpointAddr) error {
 	fromRole := from.Role()
 	toRole := to.Role()
 
-	// Relay destination: any authenticated endpoint may route to a relay
-	// in the same domain. The relay itself only checks token validity.
+	// Relay destination: relays are shared infrastructure in the reserved
+	// RelayDomain. Any authenticated endpoint can route through a relay.
+	// The relay itself only checks token validity.
 	if toRole == RoleRelay {
-		if from.Domain != to.Domain {
-			return errors.New("flow denied: relay must be in same domain")
+		if to.Domain != RelayDomain {
+			return errors.New("flow denied: relay must be in reserved domain 0")
 		}
 		ep := c.registrar.GetEndpointInfo(to)
 		if ep == nil {

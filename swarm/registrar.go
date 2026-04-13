@@ -1,16 +1,21 @@
 package swarm
 
-// Registrar is the central registration authority (broker).
+// Registrar is the central enrollment authority (broker).
 //
-// All endpoints — clients, agents, and relays — register here via
-// Ed25519 challenge-response. The registrar issues PASETO v4.public
-// tokens binding each endpoint's ID to its public key.
+// Three-phase zero-touch enrollment:
+//   Phase 1 — Enroll:   endpoint sends (PublicKey, Fingerprint, RoleFlags)
+//                       broker returns (RequestID, Challenge)
+//   Phase 2 — Confirm:  endpoint sends signed challenge
+//                       broker: if pre-approved or relay → immediately Registered
+//                               else Pending (awaits admin approval)
+//   Phase 3 — Poll:     endpoint polls with signed (RequestID|poll) nonce
+//                       broker returns current state + Result when approved
 //
-// The registrar is the single source of truth for:
-//   - Endpoint identity and state
-//   - Which relays are available per domain
-//   - Endpoint reachability (direct P2P address + relay route)
-//   - The trust root (registrar public key) for token verification
+// Address assignment:
+//   - All endpoints get domain, group, endpoint_id from the broker
+//   - Relays auto-approved, assigned to reserved domain 0, group 0
+//   - Pre-approved fingerprints auto-approve to the (domain, group) in PreApprove()
+//   - Admin-approved enrollments take (domain, group) from ApproveEnrollment()
 
 import (
 	"bytes"
@@ -25,32 +30,59 @@ import (
 
 const maxEndpointsPerGroup = 65534 // uint16 IDs 1..65534, 0 reserved
 
-// Registrar handles endpoint registration, reachability, and relay discovery.
+// Reserved address space for relay infrastructure.
+const (
+	RelayDomain DomainID = 0
+	RelayGroup  GroupID  = 0
+)
+
+// Registrar handles endpoint enrollment, reachability, and relay discovery.
 type Registrar struct {
 	mu sync.RWMutex
 
 	publicKey  ed25519.PublicKey
 	privateKey ed25519.PrivateKey
 
-	// domain -> group -> endpointID -> info
+	// Registered endpoints: domain -> group -> endpointID -> info
 	endpoints map[DomainID]map[GroupID]map[EndpointID]*RegisteredEndpoint
 
-	pending map[string]*PendingRegistration
+	// Pending/completed enrollments: RequestID -> state
+	pending map[string]*pendingEnroll
 
+	// Idempotency: fingerprint -> current RequestID
+	byFingerprint map[string]string
+
+	// Pre-approval allowlist: fingerprint -> (domain, group)
+	preApproved map[string]addrMapping
+
+	// ID allocation hint per domain+group
 	nextID map[DomainID]map[GroupID]uint16
 
-	// Reachability records: AddrKey -> info
-	// Each endpoint publishes how to reach it (direct P2P + relay route).
+	// Reachability: AddrKey -> info
 	reachability map[string]*ReachabilityInfo
 
 	tokenTTL time.Duration
 }
 
-// PendingRegistration tracks an in-progress handshake.
-type PendingRegistration struct {
-	Request   RegistrationRequest
-	Challenge [32]byte
-	State     uint8
+// pendingEnroll is the broker-side record for an in-progress enrollment.
+type pendingEnroll struct {
+	RequestID   string
+	PublicKey   ed25519.PublicKey
+	Fingerprint string
+	RoleFlags   uint8
+	Challenge   [32]byte
+	CreatedAt   time.Time
+
+	State uint8 // StateChallengeIssued / StatePending / StateRegistered / StateDenied
+
+	// Populated once Registered:
+	Address EndpointAddr
+	Token   string
+}
+
+type addrMapping struct {
+	Domain DomainID
+	Group  GroupID
 }
 
 // NewRegistrar creates a registrar with a fresh Ed25519 keypair.
@@ -61,25 +93,28 @@ func NewRegistrar(tokenTTL time.Duration) (*Registrar, error) {
 	}
 
 	return &Registrar{
-		publicKey:    pub,
-		privateKey:   priv,
-		endpoints:    make(map[DomainID]map[GroupID]map[EndpointID]*RegisteredEndpoint),
-		pending:      make(map[string]*PendingRegistration),
-		nextID:       make(map[DomainID]map[GroupID]uint16),
-		reachability: make(map[string]*ReachabilityInfo),
-		tokenTTL:     tokenTTL,
+		publicKey:     pub,
+		privateKey:    priv,
+		endpoints:     make(map[DomainID]map[GroupID]map[EndpointID]*RegisteredEndpoint),
+		pending:       make(map[string]*pendingEnroll),
+		byFingerprint: make(map[string]string),
+		preApproved:   make(map[string]addrMapping),
+		nextID:        make(map[DomainID]map[GroupID]uint16),
+		reachability:  make(map[string]*ReachabilityInfo),
+		tokenTTL:      tokenTTL,
 	}, nil
 }
 
 // PublicKey returns the registrar's public key — the trust root.
-// Distributed to all endpoints, controllers, and relays so they can
-// verify any PASETO token.
 func (r *Registrar) PublicKey() ed25519.PublicKey {
 	return r.publicKey
 }
 
-// RegisterRequest begins the challenge-response handshake.
-func (r *Registrar) RegisterRequest(req RegistrationRequest) (*Challenge, error) {
+// --- Enrollment: Phase 1 ---
+
+// Enroll starts a new enrollment. Returns a RequestID and challenge.
+// Relays must pass empty Fingerprint; client/agent must pass non-empty.
+func (r *Registrar) Enroll(req EnrollRequest) (*EnrollResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -91,16 +126,20 @@ func (r *Registrar) RegisterRequest(req RegistrationRequest) (*Challenge, error)
 		return nil, fmt.Errorf("invalid public key: expected %d bytes, got %d",
 			ed25519.PublicKeySize, len(req.PublicKey))
 	}
+	if role != RoleRelay && req.Fingerprint == "" {
+		return nil, errors.New("fingerprint required for client/agent")
+	}
 
-	fp := keyFingerprint(req.PublicKey)
-	if _, exists := r.pending[fp]; exists {
-		return nil, errors.New("registration already pending for this key")
-	}
-	if r.isKeyRegistered(req.PublicKey) {
-		return nil, errors.New("public key already registered")
-	}
-	if r.countEndpoints(req.Domain, req.Group) >= maxEndpointsPerGroup {
-		return nil, fmt.Errorf("group capacity reached (max %d)", maxEndpointsPerGroup)
+	// Idempotent: if fingerprint already has an active enrollment, return it.
+	if req.Fingerprint != "" {
+		if rid, ok := r.byFingerprint[req.Fingerprint]; ok {
+			if existing, ok := r.pending[rid]; ok {
+				return &EnrollResponse{
+					RequestID: existing.RequestID,
+					Challenge: existing.Challenge,
+				}, nil
+			}
+		}
 	}
 
 	var nonce [32]byte
@@ -108,72 +147,172 @@ func (r *Registrar) RegisterRequest(req RegistrationRequest) (*Challenge, error)
 		return nil, fmt.Errorf("generate challenge: %w", err)
 	}
 
-	r.pending[fp] = &PendingRegistration{
-		Request:   req,
-		Challenge: nonce,
-		State:     StateChallengeIssued,
+	rid, err := randomRequestID()
+	if err != nil {
+		return nil, err
 	}
 
-	return &Challenge{Nonce: nonce}, nil
+	pe := &pendingEnroll{
+		RequestID:   rid,
+		PublicKey:   ed25519.PublicKey(req.PublicKey),
+		Fingerprint: req.Fingerprint,
+		RoleFlags:   req.RoleFlags,
+		Challenge:   nonce,
+		CreatedAt:   time.Now(),
+		State:       StateChallengeIssued,
+	}
+
+	r.pending[rid] = pe
+	if req.Fingerprint != "" {
+		r.byFingerprint[req.Fingerprint] = rid
+	}
+
+	return &EnrollResponse{RequestID: rid, Challenge: nonce}, nil
 }
 
-// RegisterResponse completes the handshake: verifies signature, allocates ID,
-// issues PASETO token.
-func (r *Registrar) RegisterResponse(publicKey ed25519.PublicKey, resp ChallengeResponse) (*RegistrationResult, error) {
+// --- Enrollment: Phase 2 ---
+
+// ConfirmEnrollment verifies the challenge signature and transitions to:
+//   - Registered if relay, pre-approved fingerprint, or fingerprint previously registered
+//   - Pending otherwise (admin must call ApproveEnrollment)
+func (r *Registrar) ConfirmEnrollment(c EnrollConfirm) (*EnrollStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	fp := keyFingerprint(publicKey)
-	pending, exists := r.pending[fp]
-	if !exists {
-		return nil, errors.New("no pending registration for this key")
+	pe, ok := r.pending[c.RequestID]
+	if !ok {
+		return nil, errors.New("unknown request ID")
 	}
-	if pending.State != StateChallengeIssued {
-		return nil, fmt.Errorf("invalid state: expected %s, got %s",
-			StateName(StateChallengeIssued), StateName(pending.State))
-	}
-
-	if !ed25519.Verify(publicKey, pending.Challenge[:], resp.Signature) {
-		delete(r.pending, fp)
-		return nil, errors.New("challenge verification failed: invalid signature")
+	if pe.State != StateChallengeIssued {
+		// Already confirmed; return current state (idempotent)
+		return r.statusFor(pe), nil
 	}
 
-	id, err := r.allocateID(pending.Request.Domain, pending.Request.Group)
-	if err != nil {
-		delete(r.pending, fp)
-		return nil, fmt.Errorf("allocate ID: %w", err)
+	if !ed25519.Verify(pe.PublicKey, pe.Challenge[:], c.Signature) {
+		delete(r.pending, c.RequestID)
+		if pe.Fingerprint != "" {
+			delete(r.byFingerprint, pe.Fingerprint)
+		}
+		return nil, errors.New("challenge verification failed")
 	}
 
-	addr := EndpointAddr{
-		Domain:    pending.Request.Domain,
-		Group:     pending.Request.Group,
-		Endpoint:  id,
-		RoleFlags: pending.Request.RoleFlags,
+	// Decide auto-approval path
+	role := RoleOf(pe.RoleFlags)
+	if role == RoleRelay {
+		// Relays are infrastructure: auto-approved to reserved domain/group
+		if err := r.registerApproved(pe, RelayDomain, RelayGroup); err != nil {
+			return nil, err
+		}
+		return r.statusFor(pe), nil
 	}
 
-	now := time.Now()
-	claims := &TokenClaims{
-		EndpointID: id,
-		Domain:     pending.Request.Domain,
-		Group:      pending.Request.Group,
-		RoleFlags:  pending.Request.RoleFlags,
-		PublicKey:  []byte(publicKey),
-		IssuedAt:   now,
-		ExpiresAt:  now.Add(r.tokenTTL),
-		Issuer:     "gole-swarm-registrar",
+	if mapping, ok := r.preApproved[pe.Fingerprint]; ok {
+		if err := r.registerApproved(pe, mapping.Domain, mapping.Group); err != nil {
+			return nil, err
+		}
+		return r.statusFor(pe), nil
 	}
 
-	token, err := SignToken(claims, r.privateKey)
-	if err != nil {
-		delete(r.pending, fp)
-		return nil, fmt.Errorf("sign token: %w", err)
-	}
-
-	r.storeEndpoint(addr, publicKey, token)
-	delete(r.pending, fp)
-
-	return &RegistrationResult{ID: id, Token: token}, nil
+	// No auto-approval: wait for admin
+	pe.State = StatePending
+	return r.statusFor(pe), nil
 }
+
+// --- Enrollment: Phase 3 ---
+
+// PollEnrollment returns the current state of an enrollment.
+// Signature must be Ed25519 over (RequestID || "|poll") to prove the
+// poller is the legitimate enrolling endpoint.
+func (r *Registrar) PollEnrollment(requestID string, signature []byte) (*EnrollStatus, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	pe, ok := r.pending[requestID]
+	if !ok {
+		return nil, errors.New("unknown request ID")
+	}
+
+	msg := []byte(requestID + "|poll")
+	if !ed25519.Verify(pe.PublicKey, msg, signature) {
+		return nil, errors.New("poll signature invalid")
+	}
+
+	return r.statusFor(pe), nil
+}
+
+// --- Admin API ---
+
+// PreApprove allows a fingerprint to auto-enroll into (domain, group).
+// Call this before the endpoint enrolls for truly zero-touch deployment.
+func (r *Registrar) PreApprove(fingerprint string, domain DomainID, group GroupID) error {
+	if fingerprint == "" {
+		return errors.New("empty fingerprint")
+	}
+	if domain == RelayDomain {
+		return errors.New("domain 0 reserved for relays")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.preApproved[fingerprint] = addrMapping{Domain: domain, Group: group}
+	return nil
+}
+
+// ApproveEnrollment approves a specific pending enrollment into (domain, group).
+func (r *Registrar) ApproveEnrollment(requestID string, domain DomainID, group GroupID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pe, ok := r.pending[requestID]
+	if !ok {
+		return errors.New("unknown request ID")
+	}
+	if pe.State != StatePending {
+		return fmt.Errorf("cannot approve: state is %s", StateName(pe.State))
+	}
+	if domain == RelayDomain {
+		return errors.New("domain 0 reserved for relays")
+	}
+	return r.registerApproved(pe, domain, group)
+}
+
+// DenyEnrollment rejects a pending enrollment.
+func (r *Registrar) DenyEnrollment(requestID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pe, ok := r.pending[requestID]
+	if !ok {
+		return errors.New("unknown request ID")
+	}
+	if pe.State != StatePending && pe.State != StateChallengeIssued {
+		return fmt.Errorf("cannot deny: state is %s", StateName(pe.State))
+	}
+	pe.State = StateDenied
+	return nil
+}
+
+// ListPending returns all enrollments awaiting admin decision.
+func (r *Registrar) ListPending() []PendingEnrollment {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var out []PendingEnrollment
+	for _, pe := range r.pending {
+		if pe.State == StatePending {
+			out = append(out, PendingEnrollment{
+				RequestID:   pe.RequestID,
+				Fingerprint: pe.Fingerprint,
+				RoleFlags:   pe.RoleFlags,
+				PublicKey:   []byte(pe.PublicKey),
+				CreatedAt:   pe.CreatedAt,
+				State:       pe.State,
+			})
+		}
+	}
+	return out
+}
+
+// --- Activation / Revocation ---
 
 // ActivateEndpoint transitions Registered -> Active.
 func (r *Registrar) ActivateEndpoint(addr EndpointAddr, token string) error {
@@ -184,7 +323,6 @@ func (r *Registrar) ActivateEndpoint(addr EndpointAddr, token string) error {
 	if err != nil {
 		return fmt.Errorf("activation denied: %w", err)
 	}
-
 	if claims.EndpointID != addr.Endpoint ||
 		claims.Domain != addr.Domain ||
 		claims.Group != addr.Group ||
@@ -200,7 +338,6 @@ func (r *Registrar) ActivateEndpoint(addr EndpointAddr, token string) error {
 		return fmt.Errorf("activation denied: state is %s, expected %s",
 			StateName(ep.State), StateName(StateRegistered))
 	}
-
 	ep.State = StateActive
 	return nil
 }
@@ -221,9 +358,7 @@ func (r *Registrar) RevokeEndpoint(addr EndpointAddr) error {
 
 // --- Reachability ---
 
-// ObserveEndpoint records an endpoint's public address as seen by the
-// broker from the endpoint's connection. The endpoint doesn't know its
-// own NAT-mapped address — the broker observes it.
+// ObserveEndpoint records an endpoint's public address as seen by the broker.
 func (r *Registrar) ObserveEndpoint(addr EndpointAddr, observedAddr, proto string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -243,8 +378,6 @@ func (r *Registrar) ObserveEndpoint(addr EndpointAddr, observedAddr, proto strin
 }
 
 // SetRelayRoute records which relay an endpoint is connected to.
-// Called by the endpoint after connecting to a relay. Token-guarded:
-// an endpoint can only update its own relay route.
 func (r *Registrar) SetRelayRoute(addr EndpointAddr, token string, relayAddr EndpointAddr) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -274,7 +407,6 @@ func (r *Registrar) SetRelayRoute(addr EndpointAddr, token string, relayAddr End
 }
 
 // LookupReachability returns how to reach a target endpoint.
-// Returns (nil, nil) if no reachability info exists yet.
 func (r *Registrar) LookupReachability(target EndpointAddr) (*ReachabilityInfo, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -283,24 +415,19 @@ func (r *Registrar) LookupReachability(target EndpointAddr) (*ReachabilityInfo, 
 	if !ok {
 		return nil, nil
 	}
-
 	ep := r.getEndpoint(info.Addr)
 	if ep == nil || ep.State != StateActive {
 		return nil, nil
 	}
-
 	c := *info
 	return &c, nil
 }
 
 // RequestPunch initiates a P2P rendezvous between two endpoints.
-// Returns PunchRequests for both sides: each gets the other's observed
-// public address so they can hole-punch simultaneously.
 func (r *Registrar) RequestPunch(clientAddr, agentAddr EndpointAddr, clientToken string) (*PunchRequest, *PunchRequest, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Verify client token
 	claims, err := VerifyToken(clientToken, r.publicKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("punch denied: %w", err)
@@ -311,7 +438,6 @@ func (r *Registrar) RequestPunch(clientAddr, agentAddr EndpointAddr, clientToken
 		return nil, nil, errors.New("punch denied: token does not match client address")
 	}
 
-	// Look up both sides' observed addresses
 	clientInfo, ok := r.reachability[clientAddr.AddrKey()]
 	if !ok || clientInfo.Direct == nil {
 		return nil, nil, errors.New("punch denied: client has no observed address")
@@ -321,7 +447,6 @@ func (r *Registrar) RequestPunch(clientAddr, agentAddr EndpointAddr, clientToken
 		return nil, nil, errors.New("punch denied: agent has no observed address")
 	}
 
-	// Check both are active
 	clientEp := r.getEndpoint(clientAddr)
 	agentEp := r.getEndpoint(agentAddr)
 	if clientEp == nil || clientEp.State != StateActive {
@@ -331,7 +456,6 @@ func (r *Registrar) RequestPunch(clientAddr, agentAddr EndpointAddr, clientToken
 		return nil, nil, errors.New("punch denied: agent not active")
 	}
 
-	// Each side gets the other's observed address
 	forClient := &PunchRequest{
 		PeerAddr:     agentAddr,
 		ObservedAddr: agentInfo.Direct.ObservedAddr,
@@ -342,26 +466,17 @@ func (r *Registrar) RequestPunch(clientAddr, agentAddr EndpointAddr, clientToken
 		ObservedAddr: clientInfo.Direct.ObservedAddr,
 		Proto:        clientInfo.Direct.Proto,
 	}
-
 	return forClient, forAgent, nil
 }
 
-// ClearReachability removes reachability records for an endpoint.
+// ClearReachability removes reachability records.
 func (r *Registrar) ClearReachability(addr EndpointAddr) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.reachability, addr.AddrKey())
 }
 
-func (r *Registrar) getOrCreateReachability(addr EndpointAddr) *ReachabilityInfo {
-	key := addr.AddrKey()
-	info, ok := r.reachability[key]
-	if !ok {
-		info = &ReachabilityInfo{Addr: addr}
-		r.reachability[key] = info
-	}
-	return info
-}
+// --- Info queries ---
 
 // GetEndpointInfo returns a copy of a registered endpoint's info.
 func (r *Registrar) GetEndpointInfo(addr EndpointAddr) *RegisteredEndpoint {
@@ -391,18 +506,17 @@ func (r *Registrar) ListEndpoints(domain DomainID, group GroupID) []RegisteredEn
 	return out
 }
 
-// ListRelays returns all active relay endpoints in a domain.
-// Relays can serve any group within the domain, so they are listed
-// across all groups.
-func (r *Registrar) ListRelays(domain DomainID) []RelayInfo {
+// ListRelays returns all active relay endpoints. Relays live in the
+// reserved RelayDomain/RelayGroup and serve all business domains.
+func (r *Registrar) ListRelays(_ DomainID) []RelayInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	var out []RelayInfo
-	if dg, ok := r.endpoints[domain]; ok {
-		for _, ge := range dg {
+	if dg, ok := r.endpoints[RelayDomain]; ok {
+		if ge, ok := dg[RelayGroup]; ok {
 			for _, ep := range ge {
-				if ep.Addr.Role() == RoleRelay && ep.State == StateActive {
+				if ep.State == StateActive {
 					out = append(out, RelayInfo{Addr: ep.Addr})
 				}
 			}
@@ -411,8 +525,7 @@ func (r *Registrar) ListRelays(domain DomainID) []RelayInfo {
 	return out
 }
 
-// FullRegistrationInfo builds the complete info bundle returned to an
-// endpoint after registration + activation.
+// FullRegistrationInfo builds the complete info bundle for an active endpoint.
 func (r *Registrar) FullRegistrationInfo(addr EndpointAddr) (*RegistrationInfo, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -429,16 +542,94 @@ func (r *Registrar) FullRegistrationInfo(addr EndpointAddr) (*RegistrationInfo, 
 		ID:           ep.Addr.Endpoint,
 		Token:        ep.Token,
 		RegistrarKey: r.publicKey,
-		Relays:       r.listRelaysLocked(addr.Domain),
+		Relays:       r.listRelaysLocked(),
 	}, nil
 }
 
-func (r *Registrar) listRelaysLocked(domain DomainID) []RelayInfo {
+// --- internal helpers ---
+
+func (r *Registrar) statusFor(pe *pendingEnroll) *EnrollStatus {
+	s := &EnrollStatus{State: pe.State}
+	if pe.State == StateRegistered {
+		s.Result = &EnrollResult{Address: pe.Address, Token: pe.Token}
+	}
+	return s
+}
+
+// registerApproved finalises a pending enrollment: allocates ID, issues
+// token, stores endpoint, updates pending record. Caller holds write lock.
+func (r *Registrar) registerApproved(pe *pendingEnroll, domain DomainID, group GroupID) error {
+	// Idempotent: if this fingerprint is already registered, reuse existing endpoint
+	if existingAddr, existingEp := r.findByFingerprint(pe.Fingerprint); existingEp != nil {
+		pe.Address = existingAddr
+		pe.Token = existingEp.Token
+		pe.State = StateRegistered
+		return nil
+	}
+
+	if r.countEndpoints(domain, group) >= maxEndpointsPerGroup {
+		return fmt.Errorf("group capacity reached (max %d)", maxEndpointsPerGroup)
+	}
+
+	id, err := r.allocateID(domain, group)
+	if err != nil {
+		return fmt.Errorf("allocate ID: %w", err)
+	}
+
+	addr := EndpointAddr{
+		Domain:    domain,
+		Group:     group,
+		Endpoint:  id,
+		RoleFlags: pe.RoleFlags,
+	}
+
+	now := time.Now()
+	claims := &TokenClaims{
+		EndpointID:  id,
+		Domain:      domain,
+		Group:       group,
+		RoleFlags:   pe.RoleFlags,
+		PublicKey:   []byte(pe.PublicKey),
+		Fingerprint: pe.Fingerprint,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(r.tokenTTL),
+		Issuer:      "gole-swarm-registrar",
+	}
+
+	token, err := SignToken(claims, r.privateKey)
+	if err != nil {
+		return fmt.Errorf("sign token: %w", err)
+	}
+
+	r.storeEndpoint(addr, pe.PublicKey, token, pe.Fingerprint)
+	pe.Address = addr
+	pe.Token = token
+	pe.State = StateRegistered
+	return nil
+}
+
+func (r *Registrar) findByFingerprint(fp string) (EndpointAddr, *RegisteredEndpoint) {
+	if fp == "" {
+		return EndpointAddr{}, nil
+	}
+	for _, groups := range r.endpoints {
+		for _, eps := range groups {
+			for _, ep := range eps {
+				if ep.Fingerprint == fp && ep.State != StateRevoked {
+					return ep.Addr, ep
+				}
+			}
+		}
+	}
+	return EndpointAddr{}, nil
+}
+
+func (r *Registrar) listRelaysLocked() []RelayInfo {
 	var out []RelayInfo
-	if dg, ok := r.endpoints[domain]; ok {
-		for _, ge := range dg {
+	if dg, ok := r.endpoints[RelayDomain]; ok {
+		if ge, ok := dg[RelayGroup]; ok {
 			for _, ep := range ge {
-				if ep.Addr.Role() == RoleRelay && ep.State == StateActive {
+				if ep.State == StateActive {
 					out = append(out, RelayInfo{Addr: ep.Addr})
 				}
 			}
@@ -446,8 +637,6 @@ func (r *Registrar) listRelaysLocked(domain DomainID) []RelayInfo {
 	}
 	return out
 }
-
-// --- internal helpers ---
 
 func (r *Registrar) allocateID(domain DomainID, group GroupID) (EndpointID, error) {
 	if _, ok := r.nextID[domain]; !ok {
@@ -490,19 +679,6 @@ func (r *Registrar) isIDTaken(domain DomainID, group GroupID, id EndpointID) boo
 	return false
 }
 
-func (r *Registrar) isKeyRegistered(key []byte) bool {
-	for _, groups := range r.endpoints {
-		for _, eps := range groups {
-			for _, ep := range eps {
-				if bytes.Equal(ep.PublicKey, key) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 func (r *Registrar) countEndpoints(domain DomainID, group GroupID) int {
 	if dg, ok := r.endpoints[domain]; ok {
 		if ge, ok := dg[group]; ok {
@@ -512,7 +688,7 @@ func (r *Registrar) countEndpoints(domain DomainID, group GroupID) int {
 	return 0
 }
 
-func (r *Registrar) storeEndpoint(addr EndpointAddr, pk ed25519.PublicKey, token string) {
+func (r *Registrar) storeEndpoint(addr EndpointAddr, pk ed25519.PublicKey, token, fingerprint string) {
 	if _, ok := r.endpoints[addr.Domain]; !ok {
 		r.endpoints[addr.Domain] = make(map[GroupID]map[EndpointID]*RegisteredEndpoint)
 	}
@@ -520,10 +696,11 @@ func (r *Registrar) storeEndpoint(addr EndpointAddr, pk ed25519.PublicKey, token
 		r.endpoints[addr.Domain][addr.Group] = make(map[EndpointID]*RegisteredEndpoint)
 	}
 	r.endpoints[addr.Domain][addr.Group][addr.Endpoint] = &RegisteredEndpoint{
-		Addr:      addr,
-		PublicKey: pk,
-		State:     StateRegistered,
-		Token:     token,
+		Addr:        addr,
+		PublicKey:   pk,
+		State:       StateRegistered,
+		Token:       token,
+		Fingerprint: fingerprint,
 	}
 }
 
@@ -536,6 +713,24 @@ func (r *Registrar) getEndpoint(addr EndpointAddr) *RegisteredEndpoint {
 	return nil
 }
 
-func keyFingerprint(key []byte) string {
-	return base64.RawURLEncoding.EncodeToString(key)
+func (r *Registrar) getOrCreateReachability(addr EndpointAddr) *ReachabilityInfo {
+	key := addr.AddrKey()
+	info, ok := r.reachability[key]
+	if !ok {
+		info = &ReachabilityInfo{Addr: addr}
+		r.reachability[key] = info
+	}
+	return info
+}
+
+// Quiet unused-import warnings for helpers that moved.
+var _ = bytes.Equal
+var _ = base64.RawURLEncoding
+
+func randomRequestID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("random request ID: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }

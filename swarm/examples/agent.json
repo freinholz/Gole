@@ -1,8 +1,5 @@
 {
-    "role": "agent",
-    "domain": 1,
-    "group": 1,
-
+    "local_id": "svc-a",
     "relay_eligible": true,
     "priority": true,
 

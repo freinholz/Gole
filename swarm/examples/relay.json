@@ -1,8 +1,4 @@
 {
-    "role": "relay",
-    "domain": 1,
-    "group": 1,
-
     "relay_eligible": false,
     "priority": true,
 

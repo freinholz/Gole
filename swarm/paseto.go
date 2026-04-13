@@ -25,14 +25,15 @@ const pasetoHeader = "v4.public."
 
 // TokenClaims is the payload embedded in a PASETO v4.public token.
 type TokenClaims struct {
-	EndpointID EndpointID `json:"eid"`
-	Domain     DomainID   `json:"dom"`
-	Group      GroupID    `json:"grp"`
-	RoleFlags  uint8      `json:"rf"`
-	PublicKey  []byte     `json:"pk"`  // Ed25519 public key of the endpoint
-	IssuedAt   time.Time  `json:"iat"`
-	ExpiresAt  time.Time  `json:"exp"`
-	Issuer     string     `json:"iss"`
+	EndpointID  EndpointID `json:"eid"`
+	Domain      DomainID   `json:"dom"`
+	Group       GroupID    `json:"grp"`
+	RoleFlags   uint8      `json:"rf"`
+	PublicKey   []byte     `json:"pk"`            // Ed25519 public key of the endpoint
+	Fingerprint string     `json:"fp,omitempty"`  // machine+local_id fingerprint (audit)
+	IssuedAt    time.Time  `json:"iat"`
+	ExpiresAt   time.Time  `json:"exp"`
+	Issuer      string     `json:"iss"`
 }
 
 // le64 encodes an integer as 64-bit unsigned little-endian per PASETO spec.

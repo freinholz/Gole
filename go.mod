@@ -3,6 +3,7 @@ module github.com/shawwwn/gole
 go 1.15
 
 require (
+	github.com/denisbrodbeck/machineid v1.0.1 // indirect
 	github.com/klauspost/reedsolomon v1.9.11 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161 // indirect
